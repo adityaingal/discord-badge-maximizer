@@ -1,0 +1,9 @@
+session.json
+.env
+__pycache__/
+*.pyc
+*.png
+*.jpg
+*.mp4
+!assets/*.mp4
+!assets/*.m4v

@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: discord-badge-maximizer
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: DISCORD_BOT_TOKEN
+        sync: false
+      - key: SESSION_JSON
+        sync: false
+      - key: PYTHON_VERSION
+        value: 3.11.9
+    healthCheckPath: /
+    autoDeploy: true
