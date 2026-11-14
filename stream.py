@@ -1801,6 +1801,7 @@ class ViewerEngine:
         self.sequence: int | None = None
         self._thread: threading.Thread | None = None
         self._is_watching = False
+        self._pending_stream_key = ""
         # the media connection of the stream the alt account watches
         self.stream_conn: VoiceConnection | None = None
         self.stream_endpoint = ""
@@ -1819,6 +1820,8 @@ class ViewerEngine:
     def watch(self, stream_key: str) -> None:
         self.stream_key = stream_key
         if not self.ws or self.ws.closed:
+            # The watch request has to be sent again once the gateway is back.
+            self._pending_stream_key = stream_key
             return
         try:
             self.ws.send(json.dumps({
@@ -1827,11 +1830,12 @@ class ViewerEngine:
                     "stream_key": stream_key,
                 },
             }))
+            self._pending_stream_key = ""
             if not self._is_watching:
                 self._is_watching = True
                 self.console.ok("viewer", f"alt account ({self.username or 'alt'}) watching stream via Opcode 20 STREAM_WATCH")
         except Exception:
-            pass
+            self._pending_stream_key = stream_key
 
     def _join_stream_media(self, endpoint: str, token: str, stream_key: str) -> None:
         """Connect the alt account to the media server of the stream.
@@ -1953,6 +1957,15 @@ class ViewerEngine:
                             if self.stream_key:
                                 time.sleep(1.0)
                                 self.watch(self.stream_key)
+                            elif self._pending_stream_key:
+                                # The gateway reconnected while a stream was
+                                # running: the watch request has to be sent
+                                # again, otherwise the alt account never
+                                # joins the E2EE group of the new stream.
+                                key = self._pending_stream_key
+                                self._pending_stream_key = ""
+                                time.sleep(1.0)
+                                self.watch(key)
                         elif t == "VOICE_STATE_UPDATE":
                             if str(d.get("user_id", "")) == str(self.user_id):
                                 new_session = d.get("session_id", "")
@@ -2499,7 +2512,11 @@ class GatewayStreamEngine:
                             },
                         }))
 
-                        res_msg = self.ws.recv(timeout=4.0)
+                        # The answer can take a while on a busy gateway. If
+                        # the identify is sent while the resume is still
+                        # pending the server closes the connection with 4005
+                        # (already authenticated).
+                        res_msg = self.ws.recv(timeout=10.0)
                         if res_msg:
                             op_res = res_msg.get("op")
                             t_res = res_msg.get("t")
