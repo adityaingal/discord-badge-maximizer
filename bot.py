@@ -794,7 +794,6 @@ class StreamClaimModal(nextcord.ui.Modal):
             ephemeral=True
         )
 
-
 class Stream24Modal(nextcord.ui.Modal):
     def __init__(self, snowflake: str):
         super().__init__(title="24/7 Stream Setup")
@@ -875,11 +874,83 @@ class Stream24Modal(nextcord.ui.Modal):
         )
 
 
+class AccountModalSelectView(nextcord.ui.View):
+    """Select an account and open the matching modal for it."""
+
+    def __init__(self, accounts: list[str], modal_factory, timeout: float = 60.0):
+        super().__init__(timeout=timeout)
+        self.modal_factory = modal_factory
+        options = [
+            nextcord.SelectOption(label=f"Account {i+1}", value=snowflake)
+            for i, snowflake in enumerate(accounts)
+        ]
+        self.select_menu = nextcord.ui.Select(
+            placeholder="Select account to use",
+            options=options
+        )
+        self.add_item(self.select_menu)
+        self.select_menu.callback = self._on_select
+
+    async def _on_select(self, interaction: Interaction):
+        await interaction.response.send_modal(self.modal_factory(self.select_menu.values[0]))
+
+
+class ViewerTokenModal(nextcord.ui.Modal):
+    def __init__(self, snowflake: str):
+        super().__init__(title="Alt Viewer Account")
+        self.snowflake = snowflake
+        self.add_item(nextcord.ui.TextInput(
+            label="Alt Account Token",
+            placeholder="Paste the alt account token (leave empty to clear)",
+            required=False,
+            max_length=2000
+        ))
+
+    async def callback(self, interaction: Interaction):
+        token = self.children[0].value.strip()
+        state = multi_account_mgr.get_account(self.snowflake)
+        state.viewer_token = token
+        multi_account_mgr.persist()
+        if token:
+            await interaction.response.send_message(
+                "Alt viewer token saved. It joins the channel and watches the stream\n"
+                "automatically - Discord needs a watcher for the hours to count.",
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                "Alt viewer token cleared.",
+                ephemeral=True
+            )
+
+
 # --- Slash Commands ---
 
 @bot.slash_command(name="connect", description="Connect a Discord account")
 async def connect_command(interaction: Interaction):
     await interaction.response.send_modal(ConnectModal())
+
+
+@bot.slash_command(name="setviewer", description="Set the alt account that watches the stream")
+async def setviewer_command(interaction: Interaction):
+    accounts = list(multi_account_mgr.accounts.keys())
+
+    if not accounts:
+        await interaction.response.send_message(
+            "No accounts connected. Use /connect first.",
+            ephemeral=True
+        )
+        return
+
+    if len(accounts) == 1:
+        await interaction.response.send_modal(ViewerTokenModal(accounts[0]))
+    else:
+        view = AccountModalSelectView(accounts, ViewerTokenModal)
+        await interaction.response.send_message(
+            "Select an account to use:",
+            view=view,
+            ephemeral=True
+        )
 
 
 @bot.slash_command(name="accounts", description="List connected accounts")
@@ -899,6 +970,7 @@ async def accounts_command(interaction: Interaction):
         lines.append(
             f"{i+1}. `{snowflake[:8]}...{snowflake[-4:]}` | "
             f"Creds: {'Yes' if state.has_credentials else 'No'} | "
+            f"Alt viewer: {'Yes' if state.viewer_token else 'No'} | "
             f"Games: {state.total_games_claimed} | "
             f"Hours: {state.total_hours_claimed:,.0f}h"
         )
@@ -1096,7 +1168,7 @@ async def streamvideo_command(interaction: Interaction):
         return
 
     options = [
-        nextcord.SelectOption(label=f.name[:80], value=str(f))
+        nextcord.SelectOption(label=f.name[:80], value=f.name)
         for f in videos[:25]
     ]
     select = nextcord.ui.Select(placeholder="Select video to stream", options=options)
@@ -1104,7 +1176,11 @@ async def streamvideo_command(interaction: Interaction):
     view.add_item(select)
 
     async def _on_select(inter: Interaction):
-        video_path = select.values[0]
+        # The option carries the file name only: Discord limits a select
+        # option value to 100 characters and an absolute path easily
+        # exceeds that, which makes the whole interaction fail with
+        # "The application did not respond".
+        video_path = str(VIDEOS_DIR / select.values[0])
         if len(accounts) == 1:
             await inter.response.send_modal(StreamVideoModal(accounts[0], video_path))
         else:
