@@ -192,20 +192,43 @@ class MultiAccountManager:
 
         # 1. Check if SESSION_JSON environment variable is set (Render secret or .env)
         env_session = os.getenv("SESSION_JSON", "").strip()
-        if env_session:
-            try:
+        # Strip surrounding quotes if added in Render UI
+        if (env_session.startswith('"') and env_session.endswith('"')) or (env_session.startswith("'") and env_session.endswith("'")):
+            env_session = env_session[1:-1].strip()
+
+        if env_session and env_session not in ("{}", "null", "none"):
+            # Attempt 1: Raw JSON format
+            if env_session.startswith("{"):
                 try:
-                    decoded = base64.b64decode(env_session).decode("utf-8")
-                    raw = json.loads(decoded)
+                    parsed = json.loads(env_session)
+                    if isinstance(parsed, dict):
+                        raw = parsed
                 except Exception:
-                    raw = json.loads(env_session)
-                print("[OK] Loaded session credentials from SESSION_JSON environment variable.")
+                    pass
+
+            # Attempt 2: Base64-encoded JSON format
+            if raw is None:
+                try:
+                    clean_b64 = re.sub(r"[^A-Za-z0-9+/=]", "", env_session)
+                    pad_len = (-len(clean_b64)) % 4
+                    if pad_len:
+                        clean_b64 += "=" * pad_len
+                    decoded = base64.b64decode(clean_b64).decode("utf-8", errors="ignore")
+                    parsed = json.loads(decoded)
+                    if isinstance(parsed, dict):
+                        raw = parsed
+                except Exception:
+                    pass
+
+            if raw is not None:
+                acct_count = len(raw.get("accounts", {})) or (1 if raw.get("token") else 0)
+                print(f"[OK] Successfully loaded {acct_count} account(s) from SESSION_JSON environment variable.")
                 try:
                     STATE_STORAGE_PATH.write_text(json.dumps(raw, indent=2), encoding="utf-8")
                 except Exception:
                     pass
-            except Exception as exc:
-                print(f"[!] Warning: Failed to parse SESSION_JSON env var: {exc}")
+            else:
+                print("[!] Warning: Could not parse SESSION_JSON env var. Set valid base64 in Render or use /connect in Discord.")
 
         # 2. If not loaded from env, try reading from STATE_STORAGE_PATH
         if raw is None and STATE_STORAGE_PATH.exists():
