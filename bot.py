@@ -611,6 +611,7 @@ class AccountSelectView(nextcord.ui.View):
             for i, snowflake in enumerate(accounts)
         ]
         self.select_menu = nextcord.ui.Select(
+            custom_id="accounts_select",
             placeholder="Select account to use",
             options=options
         )
@@ -914,6 +915,7 @@ class AccountModalSelectView(nextcord.ui.View):
             for i, snowflake in enumerate(accounts)
         ]
         self.select_menu = nextcord.ui.Select(
+            custom_id="account_modal_select",
             placeholder="Select account to use",
             options=options
         )
@@ -1159,7 +1161,7 @@ async def removevideo_command(interaction: Interaction):
         nextcord.SelectOption(label=f.name[:80], value=f.name)
         for f in videos[:25]
     ]
-    select = nextcord.ui.Select(placeholder="Select video to remove", options=options)
+    select = nextcord.ui.Select(custom_id="remove_video_select", placeholder="Select video to remove", options=options)
     view = nextcord.ui.View(timeout=60.0)
     view.add_item(select)
 
@@ -1200,7 +1202,7 @@ async def streamvideo_command(interaction: Interaction):
         nextcord.SelectOption(label=f.name[:80], value=f.name)
         for f in videos[:25]
     ]
-    select = nextcord.ui.Select(placeholder="Select video to stream", options=options)
+    select = nextcord.ui.Select(custom_id="stream_video_select", placeholder="Select video to stream", options=options)
     view = nextcord.ui.View(timeout=60.0)
     view.add_item(select)
 
