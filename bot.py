@@ -1325,7 +1325,12 @@ async def exportsession_command(interaction: Interaction):
         encoded = base64.b64encode(content).decode("ascii")
         await interaction.response.send_message(
             f"**Your SESSION_JSON for Render:**\n```\n{encoded}\n```\n"
-            f"Copy and paste the above string into your Render Dashboard -> Environment -> `SESSION_JSON`.",
+            f"Copy and paste the above string into your Render Dashboard -> Environment -> `SESSION_JSON`.\n\n"
+            f":rotating_light: **This string is a credential** - it contains your Discord "
+            f"token and cookie. Paste it only into the Render environment field. "
+            f"Pasting it into a browser address bar makes Chrome show a "
+            f"\"Dangerous site\" warning and puts your token in the browser history. "
+            f"Rotate the token afterwards if it was exposed anywhere.",
             ephemeral=True
         )
     except Exception as exc:
