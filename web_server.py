@@ -387,7 +387,7 @@ def start_keep_alive_pinger() -> None:
                     pass
             except Exception:
                 pass
-            time.sleep(600)  # every 10 minutes
+            time.sleep(300)  # every 5 minutes, Render sleeps after 15
 
     thread = threading.Thread(target=_loop, daemon=True, name="RenderKeepAlive")
     thread.start()

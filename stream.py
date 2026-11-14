@@ -1944,6 +1944,7 @@ class GatewayStreamEngine:
         self._stream_recreate_attempts = 0
         self._user_left_vc = False
         self._was_already_in_vc = False
+        self._self_initiated_leave = False
         self.viewer_engine: ViewerEngine | None = None
 
         self._voice_down_since = 0.0
@@ -1964,6 +1965,7 @@ class GatewayStreamEngine:
         self.counted_stream_seconds = 0.0
         self.last_tick_time = 0.0
         self.ready_received = threading.Event()
+        self._voice_server_event = threading.Event()
         self._cached_supplemental_guilds: list[dict] = []
 
     def get_viewer_count(self) -> int:
@@ -2178,6 +2180,19 @@ class GatewayStreamEngine:
         except Exception as exc:
             self.console.warn("voice", f"could not send voice state update: {exc}")
 
+    def _join_voice_and_wait(self, timeout: float = 8.0) -> bool:
+        """Join the channel and wait for the voice server assignment.
+
+        Discord hands out a voice server with every voice state update. When
+        the account already sits in the channel the update can be ignored,
+        which leaves the engine without an endpoint. Instead of leaving the
+        channel right away the assignment is awaited first, so the account
+        stays in the voice channel while it is not necessary.
+        """
+        self._voice_server_event.clear()
+        self._join_voice_channel()
+        return self._voice_server_event.wait(timeout=timeout)
+
     def _force_rejoin_voice(self) -> None:
         """Leave then re-enter the channel so Discord issues a fresh VOICE_SERVER_UPDATE.
 
@@ -2189,6 +2204,9 @@ class GatewayStreamEngine:
             return
         try:
             C.info("voice", f"{C.GREY}› leaving channel to force a fresh voice assignment{C.RESET}")
+            # The voice state update that follows must not be read as the
+            # user leaving the channel in the Discord app.
+            self._self_initiated_leave = True
             self.ws.send(json.dumps({
                 "op": 4,
                 "d": {
@@ -2614,7 +2632,11 @@ class GatewayStreamEngine:
                 if new_session:
                     self.voice_session_id = new_session
 
-                if (self.voice_connected or self.stream_connected or self.stream_ever_active):
+                if self._self_initiated_leave:
+                    # We left the channel ourselves to get a fresh voice
+                    # assignment, this is not the user leaving.
+                    self._self_initiated_leave = False
+                elif (self.voice_connected or self.stream_connected or self.stream_ever_active):
                     if vs_channel_id is None:
                         if not self.voice_conn or self.voice_conn.ws is None or self.voice_conn.ws.closed:
                             C.warn("voice", "user manually disconnected from voice channel in Discord app")
@@ -2666,6 +2688,7 @@ class GatewayStreamEngine:
 
             self.voice_token = token
             self.voice_endpoint = endpoint
+            self._voice_server_event.set()
             C.ok("voice", f"voice server: {endpoint}")
 
             session_id = self.voice_session_id or self.gateway_session_id
@@ -2683,31 +2706,45 @@ class GatewayStreamEngine:
             )
 
             C.info("performing voice WebSocket handshake...")
-            if self.voice_conn.connect():
-                self.voice_conn.start_heartbeat()
-                self.voice_conn.send_speaking(False)
-                self.voice_conn.start_silence_pump()
-                self.voice_connected = True
-                self._watchdog_stream_retries = 0
-                C.ok("voice", f"{C.GREEN}voice connection established (ssrc={self.voice_conn.ssrc}){C.RESET}")
 
-                time.sleep(0.5)
-                C.info("requesting Go Live stream (op 18 Stream Create)...")
-                self._request_go_live()
-            else:
-                close_code = self.voice_conn.last_close_code if self.voice_conn else 0
-                if close_code == 4006:
-                    C.err("voice", "voice session id was rejected (4006) — clearing stale session id")
-                    self.voice_session_id = ""
-                C.err("voice", "voice WebSocket handshake FAILED, retrying in 3s...")
-                def _retry_voice():
-                    time.sleep(3.0)
-                    if self.running and self.ws and not self.ws.closed:
-                        if close_code == 4006:
-                            self._force_rejoin_voice()
-                        else:
-                            self._join_voice_channel()
-                threading.Thread(target=_retry_voice, daemon=True).start()
+            def _handshake():
+                # The handshake runs in its own thread: it can take a while
+                # and the gateway event loop has to keep sending heartbeats
+                # while it runs, otherwise the gateway drops the session.
+                conn = self.voice_conn
+                if not conn:
+                    return
+                if conn.connect():
+                    conn.start_heartbeat()
+                    conn.send_speaking(False)
+                    conn.start_silence_pump()
+                    self.voice_connected = True
+                    self._watchdog_stream_retries = 0
+                    C.ok("voice", f"{C.GREEN}voice connection established (ssrc={conn.ssrc}){C.RESET}")
+
+                    time.sleep(0.5)
+                    C.info("requesting Go Live stream (op 18 Stream Create)...")
+                    self._request_go_live()
+                else:
+                    close_code = conn.last_close_code if conn else 0
+                    if close_code == 4006:
+                        C.err("voice", "voice session id was rejected (4006) — clearing stale session id")
+                        self.voice_session_id = ""
+                    elif close_code == 4017:
+                        C.err("voice", "the voice server demands DAVE (E2EE) but the client does not support it")
+                    C.err("voice", "voice WebSocket handshake FAILED, retrying in 3s...")
+
+                    def _retry_voice():
+                        time.sleep(3.0)
+                        if self.running and self.ws and not self.ws.closed:
+                            if close_code == 4006:
+                                self._force_rejoin_voice()
+                            else:
+                                self._join_voice_channel()
+
+                    threading.Thread(target=_retry_voice, daemon=True).start()
+
+            threading.Thread(target=_handshake, daemon=True).start()
 
         elif event_type == "STREAM_CREATE":
             self.stream_key = d.get("stream_key", "")
@@ -2756,7 +2793,7 @@ class GatewayStreamEngine:
             if not HAS_CRYPTO:
                 C.err("crypto", "cryptography package is missing — live video streaming will NOT work! Run: pip install -r requirements.txt")
             elif self.voice_conn and self.voice_conn.secret_key:
-                C.ok("audio", "encrypted voice and video stream pump active")
+                C.ok("audio", "encrypted voice transport ready (the stream media is sent once its E2EE group exists)")
 
             viewers = self.get_viewer_count()
             if viewers == 0:

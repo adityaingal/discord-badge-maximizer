@@ -395,51 +395,43 @@ def run_stream_engine(snowflake: str, guild_id: str, channel_id: str, duration_h
             # The account may already sit in the channel (a previous session or
             # the real Discord client). Discord ignores a plain voice state
             # update when nothing changes, so no voice server answer would
-            # arrive and the stream would never start. Leaving and joining
-            # again forces a fresh assignment.
+            # arrive and the stream would never start. Wait for the answer
+            # first and only leave and join again when it does not come, so
+            # the account is not kicked out of the channel needlessly.
             if engine.detected_channel_id and str(engine.detected_channel_id) == str(channel_id):
                 engine._was_already_in_vc = True
-                C.info("voice", "account is already in this channel - forcing a fresh voice assignment")
+                C.info("voice", "account is already in this channel - waiting for the voice assignment")
+                if not engine._join_voice_and_wait(8.0):
+                    C.info("voice", "no voice server assignment - leaving and joining again")
+                    engine._force_rejoin_voice()
+            else:
                 try:
                     engine.ws.send(json.dumps({
                         "op": 4,
                         "d": {
                             "guild_id": guild_id,
-                            "channel_id": None,
+                            "channel_id": channel_id,
                             "self_mute": False,
                             "self_deaf": False,
                             "self_video": False,
                         },
                     }))
+                    C.ok("voice", f"joining voice channel ({channel_id})")
                 except Exception as exc:
-                    C.warn("voice", f"could not leave the channel: {exc}")
-                time.sleep(2.0)
+                    C.err("voice", f"failed to join: {exc}")
+                    reconnect_attempts += 1
+                    if reconnect_attempts >= max_reconnects:
+                        break
+                    time.sleep(min(30, reconnect_attempts * 2))
+                    continue
 
-            try:
-                engine.ws.send(json.dumps({
-                    "op": 4,
-                    "d": {
-                        "guild_id": guild_id,
-                        "channel_id": channel_id,
-                        "self_mute": False,
-                        "self_deaf": False,
-                        "self_video": False,
-                    },
-                }))
-                C.ok("voice", f"joining voice channel ({channel_id})")
-            except Exception as exc:
-                C.err("voice", f"failed to join: {exc}")
-                reconnect_attempts += 1
-                if reconnect_attempts >= max_reconnects:
-                    break
-                time.sleep(min(30, reconnect_attempts * 2))
-                continue
+            if engine._ticker_thread is None or not engine._ticker_thread.is_alive():
+                engine._ticker_thread = threading.Thread(target=engine._stream_ticker, daemon=True)
+                engine._ticker_thread.start()
 
-            engine._ticker_thread = threading.Thread(target=engine._stream_ticker, daemon=True)
-            engine._ticker_thread.start()
-
-            engine._watchdog_thread = threading.Thread(target=engine._watchdog_loop, daemon=True)
-            engine._watchdog_thread.start()
+            if engine._watchdog_thread is None or not engine._watchdog_thread.is_alive():
+                engine._watchdog_thread = threading.Thread(target=engine._watchdog_loop, daemon=True)
+                engine._watchdog_thread.start()
 
             C.ok("stream", f"stream active for {duration_hours}h")
             C.info("use /stopstream to stop early")
