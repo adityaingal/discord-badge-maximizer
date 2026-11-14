@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import base64
 import json
@@ -147,11 +147,22 @@ def request_analytics_credential(auth_token: str, super_properties_b64: str) -> 
     return credential
 
 
-def synchronize_credentials(state: dict, super_props_b64: str) -> None:
+def synchronize_credentials(state, super_props_b64: str) -> None:
+    """Refresh the analytics token of an account.
+
+    The account state is an AccountState object, not a dict: reading it
+    with a subscript raised a TypeError and the game command could never
+    authenticate.
+    """
     try:
-        analytics_token = request_analytics_credential(state["token"], super_props_b64)
-        state["analytics_token"] = analytics_token
-        state["fetched_at"] = int(time.time())
+        token = state["token"] if isinstance(state, dict) else state.token
+        analytics_token = request_analytics_credential(token, super_props_b64)
+        if isinstance(state, dict):
+            state["analytics_token"] = analytics_token
+            state["fetched_at"] = int(time.time())
+        else:
+            state.analytics_token = analytics_token
+            state.fetched_at = int(time.time())
     except Exception as exc:
         raise RuntimeError(f"Failed to synchronize credentials: {exc}")
 
@@ -183,35 +194,11 @@ class AccountState:
         return bool(self.token.strip()) and bool(self.cookie.strip())
 
 
-DEFAULT_SESSION_B64 = (
-    "ewogICJ0b2tlbiI6ICJNVFE1TXpnek1qUXhNemsyTXpRNE9USTVNQS5HOExYYnEuOHdJbS1HOUxDT0NvNHE5V1N4Uk4t"
-    "TlNuQmdTNldRdDVVWjdMcmMiLAogICJjb29raWUiOiAiQ3ZoZ3dpU2dpU0pjNE85Wm1xbEFLcEFaYU9ndXpXa0JtM2NkT1"
-    "VKMnozaVUwc2o4MDdRQ2t1UWNZODJ6amhwWWYxRUVUVEdpaW9hSFF1MF9HQW5WekEtcjJmbWRGcFpweXpvRDd2UTZJdzMt"
-    "U3dqYWlpQlRiLUVhUm9LdEw0N20tVkVXSU9LLW9NMWJHaWxsekZHTDcxSlhIMTdicGZoZlVOMzhtUnlaY0ViNU5Ua29tdV"
-    "ppUi1UdXpRQmVTNkU1S09zWjc4eFFZb2lLRjhQcVQxMWdPYUpiY0d5TGRiSkdJNlo1WDB2Wnd0R3ZNa1FfTnJMQnhNVjhD"
-    "aHdMY0RDSExrNndmRzVqbnQzQkRHMUVLaGtTN2p5cUlac1B0YVh3R2FMamtiZkRhaFpOZkEiLAogICJmaW5nZXJwcmludC"
-    "I6ICIiLAogICJhbmFseXRpY3NfdG9rZW4iOiAiTVRRNU16Z3pNalF4TXprMk16UTRPVEk1TUEucFJ1Q1pROHdjcHBIOTZB"
-    "bXR3NDVzb2FUWExvIiwKICAiZmV0Y2hlZF9hdCI6IDE3OTQ1OTcwMDEsCiAgInVzZWRfZ2FtZXMiOiBbXSwKICAidG90YW"
-    "xfZ2FtZXNfY2xhaW1lZCI6IDAsCiAgInRvdGFsX2hvdXJzX2NsYWltZWQiOiAwLjAsCiAgInRvdGFsX3N0cmVhbV9ob3Vy"
-    "c19jbGFpbWVkIjogMC4wLAogICJ0b3RhbF9zdHJlYW1fc2Vzc2lvbnMiOiAwLAogICJsYXN0X2d1aWxkX2lkIjogIjEzOT"
-    "Q1NTg3NzkxMzUzNjUxMjAiLAogICJsYXN0X2NoYW5uZWxfaWQiOiAiMTU3MDA3NTkzNzM4OTgxMzgzMCIsCiAgInZpZXdl"
-    "cl90b2tlbiI6ICIiLAogICJ2aWRlb19wYXRoIjogImFzc2V0cy92aWRlby5tcDQiLAogICJhdXRvX3N0cmVhbSI6IHRydW"
-    "UsCiAgImFjY291bnRzIjogewogICAgIjE0OTM4MzI0MTM5NjM0ODkyOTAiOiB7CiAgICAgICJ0b2tlbiI6ICJNVFE1TXpn"
-    "ek1qUXhNemsyTXpRNE9USTVNQS5HOExYYnEuOHdJbS1HOUxDT0NvNHE5V1N4Uk4tTlNuQmdTNldRdDVVWjdMcmMiLAogIC"
-    "AgICAiY29va2llIjogIkN2aGd3aVNnaVNKYzRPOVptcWxBS3BBWmFPZ3V6V2tCbTNjZE9VSjJ6M2lVMHNqODA3UUNrdVFj"
-    "WTgyempocFlmMUVFVFRHaWlvYUhRdTBfR0FuVnpBLXIyZm1kRnBacHl6b0Q3dlE2SXczLVN3amFpaUJUYi1FYVJvS3RMND"
-    "dtLVZFV0lPSy1vTTFiR2lsbHpGR0w3MUpYSDE3YnBmaGZVTjM4bVJ5WmNFYjVOVGtvbXVaaVItVHV6UUJlUzZFNUtPc1o3"
-    "OHhRWW9pS0Y4UHFUMTFnT2FKYmNHeUxkYkpHSTZaNVgwdlp3dEd2TWtRX05yTEJ4TVY4Q2h3TGNEQ0hMazZ3Zkc1am50M0"
-    "JERzFFS2hrUzdqeXFJWnNQdGFYd0dhTGprYmZEYWhaTmZBIiwKICAgICAgImZpbmdlcnByaW50IjogIiIsCiAgICAgICJh"
-    "bmFseXRpY3NfdG9rZW4iOiAiTVRRNU16Z3pNalF4TXprMk16UTRPVEk1TUEucFJ1Q1pROHdjcHBIOTZBbXR3NDVzb2FUWExv"
-    "IiwKICAgICAgImZldGNoZWRfYXQiOiAxNzk0NTk3MDAxLAogICAgICAidXNlZF9nYW1lcyI6IFtdLAogICAgICAidG90YW"
-    "xfZ2FtZXNfY2xhaW1lZCI6IDAsCiAgICAgICJ0b3RhbF9ob3Vyc19jbGFpbWVkIjogMC4wLAogICAgICAidmlkZW9fcGF0"
-    "aCI6ICJhc3NldHMvdmlkZW8ubXA0IiwKICAgICAgInRvdGFsX3N0cmVhbV9ob3Vyc19jbGFpbWVkIjogMC4wLAogICAgICA"
-    "idG90YWxfc3RyZWFtX3Nlc3Npb25zIjogMCwKICAgICAgImxhc3RfZ3VpbGRfaWQiOiAiMTM5NDU1ODc3OTEzNTM2NTEyMC"
-    "IsCiAgICAgICJsYXN0X2NoYW5uZWxfaWQiOiAiMTU3MDA3NTkzNzM4OTgxMzgzMCIsCiAgICAgICJ2aWV3ZXJfdG9rZW4i"
-    "OiAiIiwKICAgICAgImF1dG9fc3RyZWFtIjogdHJ1ZQogICAgfQogIH0KfQo="
-)
-
+# The default account can be supplied through the DEFAULT_SESSION_B64
+# environment variable (base64 of session.json). A credential must never be
+# hardcoded in the repository: it ends up in the git history and in every
+# clone of it.
+DEFAULT_SESSION_B64 = os.getenv("DEFAULT_SESSION_B64", "").strip()
 
 class MultiAccountManager:
     def __init__(self) -> None:
@@ -523,23 +510,37 @@ def run_stream_engine(snowflake: str, guild_id: str, channel_id: str, duration_h
 
 
 def load_game_catalog() -> list:
-    cached_content = ""
+    """The detectable games catalog as entries of games.DetectableTitle.
+
+    The catalog of Discord is published with the raw field names ("id",
+    "name", "executables"). The telemetry events need the parsed entries
+    with a title id, a display name and the windows binary, so the raw
+    catalog is always run through the parser of games.py.
+    """
+    from games import parse_catalog_entries
+
+    raw: list = []
     if DATABASE_STORAGE_PATH.exists():
         cached_content = DATABASE_STORAGE_PATH.read_text(encoding="utf-8").strip()
-    if cached_content:
+        if cached_content:
+            try:
+                titles = json.loads(cached_content)
+                if isinstance(titles, list) and titles:
+                    raw = titles
+            except (json.JSONDecodeError, ValueError):
+                raw = []
+    if not raw:
         try:
-            titles = json.loads(cached_content)
-            if titles:
-                return titles
-        except (json.JSONDecodeError, ValueError):
-            pass
+            req = urllib.request.Request(DISCORD_CATALOG_URL, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                content = resp.read().decode("utf-8")
+            DATABASE_STORAGE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            DATABASE_STORAGE_PATH.write_text(content, encoding="utf-8")
+            raw = json.loads(content)
+        except Exception:
+            return []
     try:
-        req = urllib.request.Request(DISCORD_CATALOG_URL, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            content = resp.read().decode("utf-8")
-        DATABASE_STORAGE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        DATABASE_STORAGE_PATH.write_text(content, encoding="utf-8")
-        return json.loads(content)
+        return parse_catalog_entries(json.dumps(raw))
     except Exception:
         return []
 
@@ -549,27 +550,6 @@ def identify_windows_binary(game_record: dict) -> str:
         if target.get("os") == "win32" and target.get("name"):
             return target["name"]
     return "game.exe"
-
-
-def parse_catalog_entries(raw_json: str) -> list:
-    payload = json.loads(raw_json)
-    catalog = []
-    registered_ids = set()
-
-    for item in payload:
-        record_id = str(item.get("id", ""))
-        if not record_id.isdigit() or record_id in registered_ids:
-            continue
-        if not any(entry.get("os") == "win32" and entry.get("name") for entry in item.get("executables", [])):
-            continue
-        registered_ids.add(record_id)
-        catalog.append({
-            "title_id": record_id,
-            "display_name": item.get("name", "Unknown Game"),
-            "binary_name": identify_windows_binary(item)
-        })
-
-    return catalog
 
 
 # --- UI Components ---
@@ -676,18 +656,14 @@ class GameClaimModal(nextcord.ui.Modal):
             )
             return
 
-        catalog_raw = load_game_catalog()
-        if isinstance(catalog_raw, str):
-            catalog = parse_catalog_entries(catalog_raw)
-        else:
-            catalog = catalog_raw
+        catalog = load_game_catalog()
 
         if not catalog:
             await interaction.response.send_message("Unable to load game catalog.", ephemeral=True)
             return
 
-        existing_pool = {item["title_id"] for item in catalog}
-        unprocessed = [item["title_id"] for item in catalog if item["title_id"] not in state.used_games]
+        existing_pool = {item.title_id for item in catalog}
+        unprocessed = [item.title_id for item in catalog if item.title_id not in state.used_games]
         processed = [gid for gid in state.used_games if gid in existing_pool]
 
         if isinstance(target_count, int) and len(unprocessed) >= target_count:
@@ -700,7 +676,7 @@ class GameClaimModal(nextcord.ui.Modal):
                 chosen.extend(rotated[:needed])
 
         state.used_games = [gid for gid in state.used_games if gid not in chosen] + chosen
-        registry = {item["title_id"]: item for item in catalog}
+        registry = {item.title_id: item for item in catalog}
         selected_titles = [registry[gid] for gid in chosen if gid in registry]
 
         if not selected_titles:
@@ -722,10 +698,7 @@ class GameClaimModal(nextcord.ui.Modal):
         runtime_context = RuntimeClientContext.initialize()
         fabricator = TelemetryEventFabricator(state, runtime_context)
 
-        valid_titles = []
-        for title in selected_titles:
-            title["binary_name"] = title.get("binary_name", "game.exe")
-            valid_titles.append(title)
+        valid_titles = list(selected_titles)
 
         engine = IngestionPipeline(fabricator, terminal)
         accepted = engine.execute_stream(
@@ -1395,16 +1368,16 @@ async def status_command(interaction: Interaction):
     stream_lines = []
     for sf, info in active_streams.items():
         elapsed = (time.time() - info["started_at"]) / 3600.0
-        stream_lines.append(f"• `{sf[:8]}...`: Guild `{info['guild_id']}`, Channel `{info['channel_id']}` ({elapsed:.1f}h / {info['duration']}h)")
+        stream_lines.append(f"â€¢ `{sf[:8]}...`: Guild `{info['guild_id']}`, Channel `{info['channel_id']}` ({elapsed:.1f}h / {info['duration']}h)")
     streams_text = "\n".join(stream_lines) if stream_lines else "None active"
 
     msg = (
-        f"**🤖 Discord Badge Maximizer Status**\n"
-        f"• **Render Web Port:** `{port}` (Healthy 200 OK)\n"
-        f"• **Render URL:** `{render_url}`\n"
-        f"• **Uptime:** `{uptime_str}`\n"
-        f"• **Connected Accounts:** `{len(multi_account_mgr.accounts)}`\n"
-        f"• **Active Streams ({len(active_streams)}):**\n{streams_text}\n"
+        f"**ðŸ¤– Discord Badge Maximizer Status**\n"
+        f"â€¢ **Render Web Port:** `{port}` (Healthy 200 OK)\n"
+        f"â€¢ **Render URL:** `{render_url}`\n"
+        f"â€¢ **Uptime:** `{uptime_str}`\n"
+        f"â€¢ **Connected Accounts:** `{len(multi_account_mgr.accounts)}`\n"
+        f"â€¢ **Active Streams ({len(active_streams)}):**\n{streams_text}\n"
     )
     await interaction.response.send_message(msg, ephemeral=True)
 
