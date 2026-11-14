@@ -14,6 +14,14 @@ services:
         value: "true"
       - key: DASHBOARD_KEY
         sync: false
+      - key: STREAM_WIDTH
+        value: "640"
+      - key: STREAM_HEIGHT
+        value: "360"
+      - key: STREAM_BITRATE
+        value: "600k"
+      - key: STREAM_FPS
+        value: "20"
       - key: PYTHON_VERSION
         value: 3.11.9
     healthCheckPath: /

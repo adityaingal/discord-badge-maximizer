@@ -125,6 +125,18 @@ OPUS_SILENCE = b"\xf8\xff\xfe"
 DEFAULT_VIDEO_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "video.mp4")
 VIDEO_ENV_VAR = "STREAM_VIDEO"
 
+# --- Encoder quality -----------------------------------------------------
+# The stream is transcoded locally, so a lower resolution and bitrate mean
+# less CPU and less bandwidth. Discord does not care about the picture size
+# for the streaming badge, only that a real broadcast is running.
+VIDEO_WIDTH = int(os.environ.get("STREAM_WIDTH", "640") or 640)
+VIDEO_HEIGHT = int(os.environ.get("STREAM_HEIGHT", "360") or 360)
+VIDEO_BITRATE = str(os.environ.get("STREAM_BITRATE", "600k") or "600k")
+VIDEO_FPS = int(os.environ.get("STREAM_FPS", "20") or 20)
+# The RTP clock of the video runs at 90 kHz, so one frame advances the
+# timestamp by 90000 / fps.
+VIDEO_TS_STEP = max(1, 90000 // max(1, VIDEO_FPS))
+
 # --- Discord video RTP header extensions -------------------------------
 # Discord's native UDP video packets carry a one byte RTP header extension
 # (RFC 5285 profile 0xBEDE). A Discord client sends four extension elements:
@@ -749,16 +761,17 @@ class MediaStreamPump:
             v_cmd = [
                 "ffmpeg", "-hide_banner", "-loglevel", "error",
                 "-stream_loop", "-1", "-i", self.video_path,
-                "-r", "30",
-                "-vf", "scale=848:480",
+                "-r", str(VIDEO_FPS),
+                "-vf", f"scale={VIDEO_WIDTH}:{VIDEO_HEIGHT}",
                 "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
                 "-threads", "1",
-                "-b:v", "1200k", "-maxrate", "1200k", "-bufsize", "2400k",
-                "-g", "30", "-keyint_min", "30", "-sc_threshold", "0",
+                "-b:v", VIDEO_BITRATE, "-maxrate", VIDEO_BITRATE, "-bufsize", VIDEO_BITRATE,
+                "-g", str(VIDEO_FPS), "-keyint_min", str(VIDEO_FPS), "-sc_threshold", "0",
                 "-bf", "0", "-b_strategy", "0", "-flags", "+low_delay",
                 "-force_key_frames", "expr:gte(t,n_forced*1)",
                 "-profile:v", "baseline", "-level", "3.1",
-                "-x264opts", "b-pyramid=0:bframes=0:ref=1:no-scenecut=1:keyint=30:min-keyint=30",
+                "-x264opts",
+                f"b-pyramid=0:bframes=0:ref=1:no-scenecut=1:keyint={VIDEO_FPS}:min-keyint={VIDEO_FPS}",
                 "-pix_fmt", "yuv420p",
                 "-bsf:v", "h264_mp4toannexb",
                 "-an", "-f", "h264", "pipe:1"
@@ -793,7 +806,7 @@ class MediaStreamPump:
         cur_frame: list[bytes] = []
         pending: list[bytes] = []
         next_time = time.monotonic()
-        frame_interval = 1.0 / 30.0
+        frame_interval = 1.0 / max(1, VIDEO_FPS)
         v_pkts = 0
         v_bytes = 0
         twcc_seq = random.randint(0, 0xFFFF)
@@ -891,7 +904,7 @@ class MediaStreamPump:
                 emit(data, n_idx == len(nalus) - 1)
             self.frames_sent += 1
 
-            v_ts = (v_ts + 3000) & 0xFFFFFFFF
+            v_ts = (v_ts + VIDEO_TS_STEP) & 0xFFFFFFFF
             now = time.monotonic()
             if now - last_sr >= 1.0:
                 self._send_rtcp_sr(cipher, video_ssrc, v_ts, v_pkts, v_bytes)
@@ -2867,8 +2880,8 @@ class GatewayStreamEngine:
                                             "active": True,
                                             "quality": 100,
                                             "max_bitrate": 2500000,
-                                            "max_framerate": 30,
-                                            "max_resolution": {"type": "fixed", "width": 848, "height": 480},
+                                            "max_framerate": VIDEO_FPS,
+                                            "max_resolution": {"type": "fixed", "width": VIDEO_WIDTH, "height": VIDEO_HEIGHT},
                                         }
                                     ],
                                 },
