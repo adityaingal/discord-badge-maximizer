@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -301,7 +302,16 @@ active_streams: Dict[str, dict] = {}
 def run_stream_engine(snowflake: str, guild_id: str, channel_id: str, duration_hours: float) -> None:
     """Run the GatewayStreamEngine in a background thread with auto-reconnect."""
     try:
-        from stream import State, Session, GatewayStreamEngine, Console, MiniWebSocket, GATEWAY_URL, _user_id_from_token
+        from stream import (
+            State,
+            Session,
+            GatewayStreamEngine,
+            Console,
+            MiniWebSocket,
+            ViewerEngine,
+            GATEWAY_URL,
+            _user_id_from_token,
+        )
 
         acct = multi_account_mgr.get_account(snowflake)
         state = State(
@@ -372,6 +382,39 @@ def run_stream_engine(snowflake: str, guild_id: str, channel_id: str, duration_h
             engine.guild_id = guild_id
             engine.channel_id = channel_id
 
+            # The alt viewer has to sit in the channel for Discord to count
+            # the streaming hours, so it is started before the broadcast.
+            if state.has_viewer_token:
+                if engine.viewer_engine is None:
+                    engine.viewer_engine = ViewerEngine(state.viewer_token, C)
+                    engine.viewer_engine.start(guild_id, channel_id)
+                    C.info("viewer", "automated alt viewer launched")
+            else:
+                C.warn("viewer", "no alt viewer token configured - Discord will not count the hours without a viewer")
+
+            # The account may already sit in the channel (a previous session or
+            # the real Discord client). Discord ignores a plain voice state
+            # update when nothing changes, so no voice server answer would
+            # arrive and the stream would never start. Leaving and joining
+            # again forces a fresh assignment.
+            if engine.detected_channel_id and str(engine.detected_channel_id) == str(channel_id):
+                engine._was_already_in_vc = True
+                C.info("voice", "account is already in this channel - forcing a fresh voice assignment")
+                try:
+                    engine.ws.send(json.dumps({
+                        "op": 4,
+                        "d": {
+                            "guild_id": guild_id,
+                            "channel_id": None,
+                            "self_mute": False,
+                            "self_deaf": False,
+                            "self_video": False,
+                        },
+                    }))
+                except Exception as exc:
+                    C.warn("voice", f"could not leave the channel: {exc}")
+                time.sleep(2.0)
+
             try:
                 engine.ws.send(json.dumps({
                     "op": 4,
@@ -424,7 +467,7 @@ def run_stream_engine(snowflake: str, guild_id: str, channel_id: str, duration_h
             time.sleep(min(30, reconnect_attempts * 2))
 
         try:
-            engine._cleanup(guild_id)
+            engine._cleanup(guild_id, interactive=False)
         except Exception:
             pass
 
