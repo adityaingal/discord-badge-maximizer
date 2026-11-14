@@ -1068,6 +1068,7 @@ class VoiceConnection:
         console: Console,
         label: str = "voice",
         is_stream: bool = False,
+        is_receiver: bool = False,
         stream_key: str = "",
         channel_id: str = "",
         known_users: set[str] | None = None,
@@ -1090,6 +1091,7 @@ class VoiceConnection:
         self.console = console
         self.label = label
         self.is_stream = is_stream
+        self.is_receiver = is_receiver
         self.stream_key = stream_key
         self.channel_id = channel_id
 
@@ -1273,7 +1275,7 @@ class VoiceConnection:
                 "priority": 1000,
                 "payload_type": H264_PAYLOAD_TYPE,
                 "rtx_payload_type": 102,
-                "encode": True,
+                "encode": not self.is_receiver,
                 "decode": True,
                 "parameters": {},
             })
@@ -1799,6 +1801,13 @@ class ViewerEngine:
         self.sequence: int | None = None
         self._thread: threading.Thread | None = None
         self._is_watching = False
+        # the media connection of the stream the alt account watches
+        self.stream_conn: VoiceConnection | None = None
+        self.stream_endpoint = ""
+        self.stream_token = ""
+        self.rtc_server_id = ""
+        self.rtc_channel_id = ""
+        self.session_id = ""
 
     def start(self, guild_id: str, channel_id: str) -> None:
         self.guild_id = guild_id
@@ -1823,6 +1832,58 @@ class ViewerEngine:
                 self.console.ok("viewer", f"alt account ({self.username or 'alt'}) watching stream via Opcode 20 STREAM_WATCH")
         except Exception:
             pass
+
+    def _join_stream_media(self, endpoint: str, token: str, stream_key: str) -> None:
+        """Connect the alt account to the media server of the stream.
+
+        A watcher that only sends Opcode 20 never becomes a member of the
+        E2EE group of the stream. The streamer can not encrypt its media
+        before the group exists, so the broadcast stays black for every
+        viewer.
+        """
+        if not endpoint or not token:
+            return
+        if self.stream_conn is not None:
+            try:
+                self.stream_conn.close()
+            except Exception:
+                pass
+            self.stream_conn = None
+
+        conn = VoiceConnection(
+            endpoint=endpoint,
+            server_id=self.rtc_server_id or self.guild_id,
+            user_id=self.user_id,
+            session_id=self.session_id,
+            token=token,
+            console=self.console,
+            label="viewer_rtc",
+            is_stream=True,
+            is_receiver=True,
+            stream_key=stream_key,
+            channel_id=self.rtc_channel_id or self.channel_id,
+        )
+        self.stream_conn = conn
+        self.stream_endpoint = endpoint
+        self.stream_token = token
+
+        def _connect():
+            # The media connection identifies with the voice session id of the
+            # alt account, which arrives with its own voice state update.
+            deadline = time.time() + 10.0
+            while not self.session_id and time.time() < deadline and self.running:
+                time.sleep(0.25)
+            if not self.session_id:
+                self.console.warn("viewer", "no voice session id for the alt account - the media connection cannot be identified")
+                return
+            conn.session_id = self.session_id
+            if conn.connect():
+                conn.start_heartbeat()
+                self.console.ok("viewer", "alt account joined the media connection of the stream")
+            else:
+                self.console.warn("viewer", "alt account could not join the media connection of the stream")
+
+        threading.Thread(target=_connect, daemon=True).start()
 
     def _run(self) -> None:
         C = self.console
@@ -1892,11 +1953,28 @@ class ViewerEngine:
                             if self.stream_key:
                                 time.sleep(1.0)
                                 self.watch(self.stream_key)
+                        elif t == "VOICE_STATE_UPDATE":
+                            if str(d.get("user_id", "")) == str(self.user_id):
+                                new_session = d.get("session_id", "")
+                                if new_session:
+                                    self.session_id = new_session
                         elif t == "STREAM_CREATE":
                             key = d.get("stream_key", "")
+                            self.rtc_server_id = str(d.get("rtc_server_id", "") or "")
+                            self.rtc_channel_id = str(d.get("rtc_channel_id", "") or "")
                             if key and (not self.stream_key or key == self.stream_key):
                                 time.sleep(0.5)
                                 self.watch(key)
+                        elif t == "STREAM_SERVER_UPDATE":
+                            # The gateway answers the watch request with the
+                            # media server of the stream. Connecting to it
+                            # makes the alt account a member of the E2EE
+                            # group of the stream.
+                            endpoint = d.get("endpoint") or ""
+                            token = d.get("token") or ""
+                            key = d.get("stream_key") or self.stream_key
+                            if endpoint and token and key:
+                                self._join_stream_media(endpoint, token, key)
             except Exception:
                 pass
             if not self.running:
@@ -1905,6 +1983,12 @@ class ViewerEngine:
 
     def stop(self) -> None:
         self.running = False
+        if self.stream_conn is not None:
+            try:
+                self.stream_conn.close()
+            except Exception:
+                pass
+            self.stream_conn = None
         if self.ws and not self.ws.closed:
             try:
                 self.ws.send(json.dumps({
@@ -2764,8 +2848,8 @@ class GatewayStreamEngine:
             self.rtc_server_id = d.get("rtc_server_id", "")
             # The server id and the channel id used when identifying the
             # stream connection are the ones the gateway names here.
-            self.stream_server_id = str(d.get("server_id") or self.rtc_server_id or "")
-            self.stream_channel_id = str(d.get("channel_id") or self.channel_id or "")
+            self.stream_server_id = str(d.get("rtc_server_id") or d.get("server_id") or self.rtc_server_id or "")
+            self.stream_channel_id = str(d.get("rtc_channel_id") or d.get("channel_id") or self.channel_id or "")
             C.ok("stream", f"Go Live created! stream_key: {C.CYAN}{self.stream_key}{C.RESET}")
             self.stream_connected = True
             self.stream_ever_active = True
@@ -2925,6 +3009,8 @@ class GatewayStreamEngine:
                 threading.Thread(target=_connect_stream, daemon=True).start()
 
         elif event_type == "STREAM_DELETE":
+            delete_reason = d.get("reason") or "unknown"
+            C.warn("stream", f"the server stopped the stream (reason: {delete_reason})")
             self.stream_connected = False
             self._watchdog_stream_retries = 0
             if self.voice_conn and self.voice_conn._media_pump:
