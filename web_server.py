@@ -11,11 +11,38 @@ import os
 import socketserver
 import threading
 import time
+import urllib.parse
 import urllib.request
 from typing import Any, Callable, Dict, Optional
 
 SERVER_START_TIME = time.time()
 _STATUS_PROVIDER: Optional[Callable[[], Dict[str, Any]]] = None
+
+# The public dashboard only shows counters. The account, guild and channel
+# ids are personal data and are only rendered when the request carries the
+# secret from the DASHBOARD_KEY environment variable.
+DASHBOARD_KEY_ENV = "DASHBOARD_KEY"
+
+
+def _is_authorized(query: str) -> bool:
+    key = os.getenv(DASHBOARD_KEY_ENV, "").strip()
+    if not key:
+        return False
+    params = urllib.parse.parse_qs(query)
+    return key in params.get("key", [])
+
+
+def _redact(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Strip the identifying ids from the status data."""
+    clean = dict(data)
+    streams = []
+    for stream in clean.get("active_streams", []) or []:
+        streams.append({
+            "elapsed_hours": stream.get("elapsed_hours"),
+            "duration_hours": stream.get("duration_hours"),
+        })
+    clean["active_streams"] = streams
+    return clean
 
 
 class RenderHealthCheckHandler(http.server.BaseHTTPRequestHandler):
@@ -47,6 +74,8 @@ class RenderHealthCheckHandler(http.server.BaseHTTPRequestHandler):
 
     def _handle_status_json(self) -> None:
         data = _STATUS_PROVIDER() if _STATUS_PROVIDER else {}
+        if not _is_authorized(self.path.partition("?")[2]):
+            data = _redact(data)
         body = json.dumps(data, indent=2).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -56,6 +85,9 @@ class RenderHealthCheckHandler(http.server.BaseHTTPRequestHandler):
 
     def _handle_dashboard(self) -> None:
         data = _STATUS_PROVIDER() if _STATUS_PROVIDER else {}
+        authorized = _is_authorized(self.path.partition("?")[2])
+        if not authorized:
+            data = _redact(data)
         bot_user = data.get("bot_user", "Connecting...")
         bot_online = data.get("bot_online", False)
         accounts_count = data.get("accounts_count", 0)
@@ -68,11 +100,17 @@ class RenderHealthCheckHandler(http.server.BaseHTTPRequestHandler):
         stream_rows = ""
         if active_streams:
             for s in active_streams:
+                if authorized:
+                    identity = (
+                        f"<td><code>{str(s.get('snowflake', ''))[:8]}...</code></td>"
+                        f"<td>{s.get('guild_id', '-')}</td>"
+                        f"<td>{s.get('channel_id', '-')}</td>"
+                    )
+                else:
+                    identity = "<td colspan=\"3\"><code>hidden</code></td>"
                 stream_rows += f"""
                 <tr class="stream-row">
-                    <td><code>{str(s.get('snowflake', ''))[:8]}...</code></td>
-                    <td>{s.get('guild_id', '-')}</td>
-                    <td>{s.get('channel_id', '-')}</td>
+                    {identity}
                     <td>{s.get('elapsed_hours', 0):.2f}h / {s.get('duration_hours', 0)}h</td>
                     <td><span class="badge badge-live">LIVE BROADCASTING</span></td>
                 </tr>
