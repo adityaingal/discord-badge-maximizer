@@ -509,6 +509,9 @@ def run_stream_engine(snowflake: str, guild_id: str, channel_id: str, duration_h
         print(f"Stream error for {snowflake}: {e}")
 
 
+_GAME_CATALOG_CACHE: list = []
+
+
 def load_game_catalog() -> list:
     """The detectable games catalog as entries of games.DetectableTitle.
 
@@ -516,7 +519,15 @@ def load_game_catalog() -> list:
     "name", "executables"). The telemetry events need the parsed entries
     with a title id, a display name and the windows binary, so the raw
     catalog is always run through the parser of games.py.
+
+    The parsed catalog is kept in memory: parsing the list of more than
+    25.000 titles takes a second and the command has to answer Discord
+    within three seconds.
     """
+    global _GAME_CATALOG_CACHE
+    if _GAME_CATALOG_CACHE:
+        return _GAME_CATALOG_CACHE
+
     from games import parse_catalog_entries
 
     raw: list = []
@@ -540,9 +551,10 @@ def load_game_catalog() -> list:
         except Exception:
             return []
     try:
-        return parse_catalog_entries(json.dumps(raw))
+        _GAME_CATALOG_CACHE = parse_catalog_entries(json.dumps(raw))
     except Exception:
         return []
+    return _GAME_CATALOG_CACHE
 
 
 def identify_windows_binary(game_record: dict) -> str:
@@ -633,24 +645,29 @@ class GameClaimModal(nextcord.ui.Modal):
         ))
 
     async def callback(self, interaction: Interaction):
+        # The catalog, the token refresh and the telemetry take longer than
+        # the three seconds Discord gives an interaction. Acknowledge first,
+        # then do the work and report it as a followup.
+        await interaction.response.defer(ephemeral=True)
+
         raw_count = self.children[0].value.strip()
         raw_hours = self.children[1].value.strip()
 
         try:
             target_count = int(raw_count) if raw_count.lower() != "all" else "all"
         except ValueError:
-            await interaction.response.send_message("Invalid game count specified.", ephemeral=True)
+            await interaction.followup.send("Invalid game count specified.", ephemeral=True)
             return
 
         try:
             target_hours = float(raw_hours) if raw_hours else 1.0
         except ValueError:
-            await interaction.response.send_message("Invalid hours specified.", ephemeral=True)
+            await interaction.followup.send("Invalid hours specified.", ephemeral=True)
             return
 
         state = multi_account_mgr.get_account(self.snowflake)
         if not state.has_credentials:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "No credentials for this account. Use /connect first.",
                 ephemeral=True
             )
@@ -659,7 +676,7 @@ class GameClaimModal(nextcord.ui.Modal):
         catalog = load_game_catalog()
 
         if not catalog:
-            await interaction.response.send_message("Unable to load game catalog.", ephemeral=True)
+            await interaction.followup.send("Unable to load game catalog.", ephemeral=True)
             return
 
         existing_pool = {item.title_id for item in catalog}
@@ -680,7 +697,7 @@ class GameClaimModal(nextcord.ui.Modal):
         selected_titles = [registry[gid] for gid in chosen if gid in registry]
 
         if not selected_titles:
-            await interaction.response.send_message("No titles selected.", ephemeral=True)
+            await interaction.followup.send("No titles selected.", ephemeral=True)
             return
 
         duration_ms = int(target_hours * 3600 * 1000)
@@ -689,7 +706,7 @@ class GameClaimModal(nextcord.ui.Modal):
             super_props = generate_fallback_super_props()
             synchronize_credentials(state, super_props)
         except Exception as exc:
-            await interaction.response.send_message(f"Auth failed: {exc}", ephemeral=True)
+            await interaction.followup.send(f"Auth failed: {exc}", ephemeral=True)
             return
 
         from games import TerminalInterface, IngestionPipeline, RuntimeClientContext, TelemetryEventFabricator
@@ -710,10 +727,9 @@ class GameClaimModal(nextcord.ui.Modal):
         state.total_hours_claimed += accepted * target_hours
         multi_account_mgr.persist()
 
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"Processed {accepted}/{len(valid_titles)} titles ({accepted * target_hours:,.0f}h total)\n"
-            f"Badge updates in 24-48h.",
-            ephemeral=True
+            f"Badge updates in 24-48h."
         )
 
 
