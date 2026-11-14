@@ -631,16 +631,16 @@ class MediaStreamPump:
             v_cmd = [
                 "ffmpeg", "-hide_banner", "-loglevel", "error",
                 "-stream_loop", "-1", "-i", self.video_path,
-                "-r", "60",
+                "-r", "30",
                 "-vf", "scale=848:480",
                 "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
                 "-threads", "1",
                 "-b:v", "1200k", "-maxrate", "1200k", "-bufsize", "2400k",
-                "-g", "60", "-keyint_min", "60", "-sc_threshold", "0",
+                "-g", "30", "-keyint_min", "30", "-sc_threshold", "0",
                 "-bf", "0", "-b_strategy", "0", "-flags", "+low_delay",
                 "-force_key_frames", "expr:gte(t,n_forced*1)",
                 "-profile:v", "baseline", "-level", "3.1",
-                "-x264opts", "b-pyramid=0:bframes=0:ref=1:no-scenecut=1:keyint=60:min-keyint=60",
+                "-x264opts", "b-pyramid=0:bframes=0:ref=1:no-scenecut=1:keyint=30:min-keyint=30",
                 "-pix_fmt", "yuv420p",
                 "-bsf:v", "h264_mp4toannexb,dump_extra=freq=keyframe,h264_metadata=aud=insert",
                 "-an", "-f", "h264", "pipe:1"
@@ -721,8 +721,8 @@ class MediaStreamPump:
                 if len(data) <= 1100:
                     marker = 0x80 if is_last_nalu else 0x00
                     rtp_hdr = struct.pack(">BBHII", 0x90, marker | 101, v_seq & 0xFFFF, v_ts & 0xFFFFFFFF, video_ssrc)
-                    packet_header = rtp_hdr + b"\xbe\xde\x00\x01"
-                    plaintext = b"\x51\x00\x00\x00" + data
+                    packet_header = rtp_hdr + b"\xbe\xde\x00\x01\x51\x00\x00\x00"
+                    plaintext = data
                     with self.conn._nonce_lock:
                         self.conn.nonce_counter += 1
                         cnt = self.conn.nonce_counter
@@ -754,8 +754,8 @@ class MediaStreamPump:
                         is_last_packet = is_last_nalu and (idx == total_chunks - 1)
                         marker = 0x80 if is_last_packet else 0x00
                         rtp_hdr = struct.pack(">BBHII", 0x90, marker | 101, v_seq & 0xFFFF, v_ts & 0xFFFFFFFF, video_ssrc)
-                        packet_header = rtp_hdr + b"\xbe\xde\x00\x01"
-                        plaintext = b"\x51\x00\x00\x00" + fu_payload
+                        packet_header = rtp_hdr + b"\xbe\xde\x00\x01\x51\x00\x00\x00"
+                        plaintext = fu_payload
                         with self.conn._nonce_lock:
                             self.conn.nonce_counter += 1
                             cnt = self.conn.nonce_counter
@@ -1036,7 +1036,7 @@ class VoiceConnection:
             "user_id": self.user_id,
             "session_id": self.session_id,
             "token": self.token,
-            "max_dave_protocol_version": 1,
+            "max_dave_protocol_version": 0,
         }
         if self.is_stream:
             if self.stream_key:
