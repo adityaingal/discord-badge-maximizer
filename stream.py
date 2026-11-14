@@ -65,6 +65,13 @@ except ImportError:
 HAS_DAVE = False
 DAVE_ENABLED = True
 
+try:
+    import dave
+
+    HAS_DAVE = True
+except Exception:  # pragma: no cover - dave.py is an optional dependency
+    dave = None
+
 ROOT = Path(__file__).resolve().parent
 WORKSPACE_DIR = ROOT
 STATE_FILE = ROOT / "session.json"
@@ -94,8 +101,11 @@ USER_AGENT = (
 
 AUTH_MAX_AGE = 12 * 3600
 
-# DAVE E2EE is disabled for stability - MLS protocol errors cause stream failures
-DAVE_DISABLED = True
+# Discord made DAVE (its E2EE protocol) mandatory for voice channels and Go
+# Live streams: a client that advertises no DAVE version is disconnected with
+# close code 4017 ("E2EE/DAVE protocol required"). The protocol is therefore
+# always announced when the library is available.
+DAVE_DISABLED = False
 
 STREAM_TIERS = [
     (1, "Newcomer", 1),
@@ -690,6 +700,9 @@ class MediaStreamPump:
         self.a_proc: subprocess.Popen | None = None
         self.v_thread: threading.Thread | None = None
         self.a_thread: threading.Thread | None = None
+        self.packets_sent: int = 0
+        self.frames_sent: int = 0
+        self.last_error: str = ""
 
     def _send_rtcp_sr(self, cipher: AESGCM, ssrc: int, rtp_ts: int, pkt_count: int, byte_count: int) -> None:
         now_wall = time.time()
@@ -828,6 +841,7 @@ class MediaStreamPump:
                     self.conn.udp_sock.sendto(packet, (self.conn.voice_ip, self.conn.voice_port))
                     v_pkts += 1
                     v_bytes += len(packet)
+                    self.packets_sent += 1
                 except Exception:
                     pass
                 v_seq = (v_seq + 1) & 0xFFFF
@@ -875,6 +889,7 @@ class MediaStreamPump:
 
             for n_idx, data in enumerate(nalus):
                 emit(data, n_idx == len(nalus) - 1)
+            self.frames_sent += 1
 
             v_ts = (v_ts + 3000) & 0xFFFFFFFF
             now = time.monotonic()
@@ -1042,6 +1057,7 @@ class VoiceConnection:
         is_stream: bool = False,
         stream_key: str = "",
         channel_id: str = "",
+        known_users: set[str] | None = None,
     ) -> None:
         cleaned = endpoint.replace("wss://", "").replace("https://", "").rstrip("/")
         if ":" in cleaned:
@@ -1082,10 +1098,12 @@ class VoiceConnection:
         self._media_pump: MediaStreamPump | None = None
         self._hb_thread: threading.Thread | None = None
         self._audio_thread: threading.Thread | None = None
-        self.connected_users: set[str] = set()
+        self.connected_users: set[str] = set(known_users or set())
+        self._pending: list[dict] = []
         self.dave_session: Any = None
         self.dave_encryptor: Any = None
         self.dave_protocol_version: int = 0
+        self.media_session_id: str = ""
         self.last_close_code: int = 0
         self.last_close_reason: str = ""
 
@@ -1094,7 +1112,7 @@ class VoiceConnection:
             return
         try:
             ver = self.dave_protocol_version if self.dave_protocol_version > 0 else 1
-            gid = (int(self.server_id) - 1) if (self.is_stream and str(self.server_id).isdigit()) else (int(self.channel_id) if (self.channel_id and str(self.channel_id).isdigit()) else (int(self.server_id) if str(self.server_id).isdigit() else 0))
+            gid = self._dave_group_id()
             self.dave_session = dave.Session()
             self.dave_session.init(ver, gid, str(self.user_id))
             self.dave_encryptor = dave.Encryptor()
@@ -1109,6 +1127,21 @@ class VoiceConnection:
         except Exception:
             self.dave_session = None
             self.dave_encryptor = None
+
+    def _dave_group_id(self) -> int:
+        """The MLS group id of this connection.
+
+        A voice connection uses the id of the voice channel, a Go Live stream
+        uses its own media session (one less than the stream rtc_server_id)
+        instead of the channel of the call.
+        """
+        if self.is_stream and str(self.server_id or "").isdigit():
+            return int(self.server_id) - 1
+        if str(self.channel_id or "").isdigit():
+            return int(self.channel_id)
+        if str(self.server_id or "").isdigit():
+            return int(self.server_id)
+        return 0
 
     def _update_dave_ratchet(self) -> None:
         if not HAS_DAVE or not self.dave_session:
@@ -1153,6 +1186,14 @@ class VoiceConnection:
             "token": self.token,
             "max_dave_protocol_version": 0,
         }
+        if HAS_DAVE:
+            try:
+                identify_d["max_dave_protocol_version"] = int(dave.get_max_supported_protocol_version())
+            except Exception:
+                identify_d["max_dave_protocol_version"] = 1
+        else:
+            C.err(self.label, "DAVE support is missing - Discord requires E2EE for voice and Go Live. Run: pip install dave.py")
+            return False
         if self.is_stream:
             if self.stream_key:
                 identify_d["stream_key"] = self.stream_key
@@ -1245,6 +1286,7 @@ class VoiceConnection:
         d = msg.get("d", {})
         self.secret_key = bytes(d.get("secret_key", []))
         self.encryption_mode = d.get("mode", self.encryption_mode)
+        self.media_session_id = str(d.get("media_session_id", "") or "")
         a_codec = d.get("audio_codec", "opus")
         v_codec = d.get("video_codec", "none")
         self.dave_protocol_version = d.get("dave_protocol_version", 0)
@@ -1289,6 +1331,13 @@ class VoiceConnection:
                 return msg
             if msg.get("op") == 3:
                 self._send_heartbeat()
+            else:
+                # Keep every other event: the DAVE handshake and the client
+                # list arrive while we wait for Ready / Session Description
+                # and would otherwise be thrown away. Without the client
+                # list the MLS proposals cannot be verified and the E2EE
+                # group never forms.
+                self._pending.append(msg)
         return None
 
     def _send_heartbeat(self) -> None:
@@ -1339,7 +1388,13 @@ class VoiceConnection:
                     self._send_heartbeat()
                     last_hb = now
                 try:
-                    msg = self.ws.recv(timeout=1.0)
+                    if self._pending:
+                        # Events that arrived while the handshake was running
+                        # (the client list, the DAVE messages) are handled
+                        # before new ones.
+                        msg = self._pending.pop(0)
+                    else:
+                        msg = self.ws.recv(timeout=1.0)
                     if not msg:
                         continue
                     op = msg.get("op")
@@ -1379,60 +1434,7 @@ class VoiceConnection:
                         self.dave_protocol_version = d.get("protocol_version", 1)
                         self._init_dave()
                     elif op == "binary":
-                        raw = msg.get("data", b"")
-                        if raw:
-                            if not self.dave_session:
-                                self._init_dave()
-                            b_op = raw[0] if raw[0] in (25, 26, 27, 28, 29, 30) else (raw[2] if len(raw) >= 3 and raw[2] in (25, 26, 27, 28, 29, 30) else None)
-                            offset = 1 if (b_op is not None and raw[0] == b_op) else 3
-                            if b_op == 25 and self.dave_session:
-                                try:
-                                    self.dave_session.set_external_sender(raw[offset:])
-                                except Exception:
-                                    pass
-                            elif b_op == 27 and self.dave_session:
-                                try:
-                                    commit = self.dave_session.process_proposals(raw[offset:], self.connected_users)
-                                    if commit and self.ws and not self.ws.closed:
-                                        self.ws.send_binary(bytes([28]) + commit)
-                                except Exception:
-                                    pass
-                            elif b_op == 29:
-                                t_id = struct.unpack(">H", raw[offset:offset+2])[0] if len(raw) >= offset + 2 else 0
-                                if self.dave_session:
-                                    try:
-                                        self.dave_session.process_commit(raw[offset+2:])
-                                    except Exception:
-                                        if t_id and self.ws and not self.ws.closed:
-                                            try:
-                                                self.ws.send(json.dumps({"op": 31, "d": {"transition_id": t_id}}))
-                                            except Exception:
-                                                pass
-                                        self._init_dave()
-                                if t_id and self.ws and not self.ws.closed:
-                                    try:
-                                        self.ws.send(json.dumps({"op": 23, "d": {"transition_id": t_id}}))
-                                    except Exception:
-                                        pass
-                                self._update_dave_ratchet()
-                            elif b_op == 30:
-                                t_id = struct.unpack(">H", raw[offset:offset+2])[0] if len(raw) >= offset + 2 else 0
-                                if self.dave_session:
-                                    try:
-                                        self.dave_session.process_welcome(raw[offset+2:], self.connected_users)
-                                    except Exception:
-                                        if t_id and self.ws and not self.ws.closed:
-                                            try:
-                                                self.ws.send(json.dumps({"op": 31, "d": {"transition_id": t_id}}))
-                                            except Exception:
-                                                pass
-                                        self._init_dave()
-                                if t_id and self.ws and not self.ws.closed:
-                                    try:
-                                        self.ws.send(json.dumps({"op": 23, "d": {"transition_id": t_id}}))
-                                    except Exception:
-                                        pass
-                                self._update_dave_ratchet()
+                        self._handle_dave_binary(msg.get("data", b""))
                     elif op == "close":
                         code = msg.get("code")
                         reason = msg.get("reason")
@@ -1443,6 +1445,79 @@ class VoiceConnection:
 
         self._hb_thread = threading.Thread(target=_loop, daemon=True)
         self._hb_thread.start()
+
+    def wait_for_dave(self, timeout: float = 30.0) -> bool:
+        """Wait until the E2EE group of this connection is usable.
+
+        The group only exists once every participant of the call or of the
+        stream joined it, so the media can not be encrypted before that.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.dave_encryptor is not None:
+                try:
+                    if self.dave_encryptor.has_key_ratchet():
+                        return True
+                except Exception:
+                    pass
+            if not self.running or not self.ws or self.ws.closed:
+                return False
+            time.sleep(0.25)
+        return False
+
+    def _handle_dave_binary(self, raw: bytes) -> None:
+        """Process a binary DAVE message of the voice WebSocket."""
+        if not raw:
+            return
+        if not self.dave_session:
+            self._init_dave()
+        if not self.dave_session:
+            return
+
+        b_op = None
+        if raw[0] in (25, 26, 27, 28, 29, 30):
+            b_op = raw[0]
+            offset = 1
+        elif len(raw) >= 3 and raw[2] in (25, 26, 27, 28, 29, 30):
+            # Gateway v8 prefixes binary messages with a sequence number
+            b_op = raw[2]
+            offset = 3
+        else:
+            return
+
+        if b_op == 25:
+            self.dave_session.set_external_sender(raw[offset:])
+            self.console.info("dave", "external sender package received")
+        elif b_op == 27:
+            commit = self.dave_session.process_proposals(raw[offset:], self.connected_users)
+            if commit and self.ws and not self.ws.closed:
+                self.ws.send_binary(bytes([28]) + commit)
+                self.console.info("dave", "MLS proposals processed, commit sent")
+            else:
+                self.console.warn("dave", "MLS proposals produced no commit")
+        elif b_op in (29, 30):
+            t_id = struct.unpack(">H", raw[offset:offset + 2])[0] if len(raw) >= offset + 2 else 0
+            payload = raw[offset + 2:]
+            try:
+                if b_op == 29:
+                    self.dave_session.process_commit(payload)
+                else:
+                    self.dave_session.process_welcome(payload, self.connected_users)
+                self.console.info("dave", f"MLS {'commit' if b_op == 29 else 'welcome'} applied (transition {t_id})")
+            except Exception as exc:
+                self.console.warn("dave", f"MLS {'commit' if b_op == 29 else 'welcome'} rejected: {exc}")
+                if t_id and self.ws and not self.ws.closed:
+                    try:
+                        self.ws.send(json.dumps({"op": 31, "d": {"transition_id": t_id}}))
+                    except Exception:
+                        pass
+                self._init_dave()
+            if t_id and self.ws and not self.ws.closed:
+                try:
+                    self.ws.send(json.dumps({"op": 23, "d": {"transition_id": t_id}}))
+                except Exception:
+                    pass
+            self._update_dave_ratchet()
 
     def send_speaking(self, speaking: bool = True, is_video: bool = True) -> None:
         if self.ws and not self.ws.closed:
@@ -2604,6 +2679,7 @@ class GatewayStreamEngine:
                 label="voice",
                 is_stream=False,
                 channel_id=self.channel_id,
+                known_users={str(u) for u in self.channel_members} | {str(self.user_id)},
             )
 
             C.info("performing voice WebSocket handshake...")
@@ -2765,16 +2841,35 @@ class GatewayStreamEngine:
                         except Exception:
                             pass
                         C.ok("stream_rtc", f"stream media connection active (ssrc={self.stream_conn.ssrc})")
-                        video_file = resolve_video_path(self.state)
-                        if os.path.exists(video_file):
+
+                        def _start_media():
+                            video_file = resolve_video_path(self.state)
+                            if not os.path.exists(video_file):
+                                C.warn("stream_rtc", f"media file not found: {video_file}")
+                                C.info("stream_rtc", f"{C.GREY}› set a valid file with menu option 7 or the STREAM_VIDEO env var{C.RESET}")
+                                self.stream_conn.start_silence_pump()
+                                return
                             C.ok("stream_rtc", f"media source: {video_file}")
                             if not self.stream_conn.start_media_stream(video_file):
                                 C.err("stream_rtc", "the media pump failed to start - viewers will only hear silence")
                                 self.stream_conn.start_silence_pump()
-                        else:
-                            C.warn("stream_rtc", f"media file not found: {video_file}")
-                            C.info("stream_rtc", f"{C.GREY}› set a valid file with menu option 7 or the STREAM_VIDEO env var{C.RESET}")
-                            self.stream_conn.start_silence_pump()
+
+                        def _start_media_when_encrypted():
+                            # Discord only accepts the media once the E2EE
+                            # group of the stream exists, which happens when
+                            # the first watcher joins the stream.
+                            while self.stream_conn and self.stream_conn.running:
+                                if self.stream_conn.wait_for_dave(30.0):
+                                    C.ok("stream_rtc", "stream E2EE group established - the media is encrypted")
+                                    _start_media()
+                                    return
+                                if not self.stream_conn.dave_session:
+                                    break
+                                C.info("stream_rtc", f"{C.GREY}› waiting for a watcher to join the stream (E2EE group){C.RESET}")
+                            C.warn("stream_rtc", "no watcher joined the stream - the E2EE group never formed")
+                            C.info("stream_rtc", f"{C.GREY}› configure an alt account with /setviewer so the stream is watched{C.RESET}")
+
+                        threading.Thread(target=_start_media_when_encrypted, daemon=True).start()
                     else:
                         C.err("stream_rtc", "stream media connection handshake failed - no video will be sent")
                 threading.Thread(target=_connect_stream, daemon=True).start()
