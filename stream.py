@@ -47,6 +47,11 @@ from pathlib import Path
 from typing import Any, Sequence
 
 try:
+    from h264 import rewrite_frame as _rewrite_frame
+except Exception:  # pragma: no cover - the rewriter is optional at import time
+    _rewrite_frame = None
+
+try:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     HAS_CRYPTO = True
 except ImportError:
@@ -61,6 +66,7 @@ HAS_DAVE = False
 DAVE_ENABLED = True
 
 ROOT = Path(__file__).resolve().parent
+WORKSPACE_DIR = ROOT
 STATE_FILE = ROOT / "session.json"
 
 if sys.platform == "win32":
@@ -108,6 +114,99 @@ OPUS_SILENCE = b"\xf8\xff\xfe"
 
 DEFAULT_VIDEO_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "video.mp4")
 VIDEO_ENV_VAR = "STREAM_VIDEO"
+
+# --- Discord video RTP header extensions -------------------------------
+# Discord's native UDP video packets carry a one byte RTP header extension
+# (RFC 5285 profile 0xBEDE). A Discord client sends four extension elements:
+# a transport wide sequence number (id 5), the playout delay (id 6), the
+# screen content type (id 7) and the stream id (id 11). Discord's media
+# worker drops packets that do not carry these ids, which shows up as a live
+# stream that never renders any picture (viewers report error 2012).
+RTP_EXT_PROFILE = 0xBEDE
+RTP_EXT_TWCC_SEQ = 5
+RTP_EXT_PLAYOUT_DELAY = 6
+RTP_EXT_CONTENT_TYPE = 7
+RTP_EXT_STREAM_ID = 11
+VIDEO_STREAM_ID = "100"
+VIDEO_CONTENT_TYPE_SCREEN = 0
+
+# The H.264 RTP payload type used by Discord for screen shares.
+H264_PAYLOAD_TYPE = 101
+# Maximum RTP payload size Discord accepts per video packet.
+MAX_RTP_PAYLOAD = 1100
+
+
+def build_rtp_extension(
+    twcc_seq: int,
+    content_type: int = VIDEO_CONTENT_TYPE_SCREEN,
+    stream_id: str = VIDEO_STREAM_ID,
+) -> tuple[bytes, bytes]:
+    """Build the RTP header extension of a Discord video packet.
+
+    Returns ``(preamble, elements)``. The preamble is the cleartext 4 byte
+    extension header that belongs to the AEAD additional authenticated data,
+    the elements are the extension itself which travels inside the encrypted
+    payload.
+    """
+    elements = bytearray()
+
+    # One byte header (RFC 5285): ID in the high nibble, the length of the
+    # element data minus one in the low nibble.
+    elements.append((RTP_EXT_TWCC_SEQ << 4) | 1)
+    elements.extend(struct.pack(">H", twcc_seq & 0xFFFF))
+
+    elements.append((RTP_EXT_PLAYOUT_DELAY << 4) | 1)
+    elements.extend(struct.pack(">BB", 100, 100))
+
+    elements.append((RTP_EXT_CONTENT_TYPE << 4) | 0)
+    elements.append(content_type & 0xFF)
+
+    sid = stream_id.encode("ascii")[:15]
+    elements.append((RTP_EXT_STREAM_ID << 4) | (len(sid) - 1))
+    elements.extend(sid)
+
+    while len(elements) % 4:
+        elements.append(0)
+
+    preamble = struct.pack(">BBH", 0xBE, RTP_EXT_PROFILE & 0xFF, len(elements) // 4)
+    return preamble, bytes(elements)
+
+
+def _exp_golomb_first_mb(nal: bytes) -> int | None:
+    """Read ``first_mb_in_slice`` from a slice NAL, or None when unreadable."""
+    if len(nal) < 2:
+        return None
+    raw = bytearray()
+    zeros = 0
+    for byte in nal[1:]:
+        if zeros >= 2 and byte == 0x03:
+            zeros = 0
+            continue
+        raw.append(byte)
+        zeros = zeros + 1 if byte == 0 else 0
+    try:
+        pos = 0
+        leading = 0
+        while True:
+            byte = raw[pos >> 3]
+            bit = (byte >> (7 - (pos & 7))) & 1
+            pos += 1
+            if bit:
+                break
+            leading += 1
+            if leading > 32:
+                return None
+        if leading == 0:
+            return 0
+        value = 0
+        for _ in range(leading):
+            byte = raw[pos >> 3]
+            bit = (byte >> (7 - (pos & 7))) & 1
+            value = (value << 1) | bit
+            pos += 1
+        return (1 << leading) - 1 + value
+    except Exception:
+        return None
 
 
 def _user_id_from_token(token: str) -> str:
@@ -620,6 +719,12 @@ class MediaStreamPump:
         if not self.conn.secret_key or not self.conn.udp_sock:
             self.console.warn("stream", "encryption key or udp socket missing, falling back to silence")
             return False
+        if self.conn.encryption_mode != "aead_aes256_gcm_rtpsize":
+            self.console.err("stream", f"the media pump needs aead_aes256_gcm_rtpsize but the connection uses '{self.conn.encryption_mode}'")
+            return False
+        if not shutil.which("ffmpeg"):
+            self.console.err("stream", "ffmpeg was not found on PATH — real video streaming is impossible")
+            return False
         try:
             if sys.platform == "win32":
                 try:
@@ -642,7 +747,7 @@ class MediaStreamPump:
                 "-profile:v", "baseline", "-level", "3.1",
                 "-x264opts", "b-pyramid=0:bframes=0:ref=1:no-scenecut=1:keyint=30:min-keyint=30",
                 "-pix_fmt", "yuv420p",
-                "-bsf:v", "h264_mp4toannexb,dump_extra=freq=keyframe,h264_metadata=aud=insert",
+                "-bsf:v", "h264_mp4toannexb",
                 "-an", "-f", "h264", "pipe:1"
             ]
             a_cmd = [
@@ -673,16 +778,71 @@ class MediaStreamPump:
         video_ssrc = self.conn.video_ssrc or (self.conn.ssrc + 1)
         buf = bytearray()
         cur_frame: list[bytes] = []
+        pending: list[bytes] = []
         next_time = time.monotonic()
         frame_interval = 1.0 / 30.0
         v_pkts = 0
         v_bytes = 0
+        twcc_seq = random.randint(0, 0xFFFF)
         last_sr = time.monotonic()
 
+        def emit(nalu: bytes, marker: bool) -> None:
+            """Packetize one NAL unit into (possibly several) RTP packets."""
+            nonlocal v_seq, v_pkts, v_bytes, twcc_seq
+            if len(nalu) <= MAX_RTP_PAYLOAD:
+                chunks = [(nalu, marker)]
+            else:
+                hdr = nalu[0]
+                ntype = hdr & 0x1F
+                fnri = hdr & 0xE0
+                fu_ind = fnri | 28
+                body = nalu[1:]
+                csize = MAX_RTP_PAYLOAD
+                total_chunks = (len(body) + csize - 1) // csize
+                chunks = []
+                for idx in range(total_chunks):
+                    c = body[idx * csize : (idx + 1) * csize]
+                    if idx == 0:
+                        fu_hdr = 0x80 | ntype
+                    elif idx == total_chunks - 1:
+                        fu_hdr = 0x40 | ntype
+                    else:
+                        fu_hdr = ntype
+                    chunks.append((bytes([fu_ind, fu_hdr]) + c, marker and idx == total_chunks - 1))
+
+            for payload, is_last in chunks:
+                rtp_hdr = struct.pack(
+                    ">BBHII", 0x90, (0x80 if is_last else 0x00) | H264_PAYLOAD_TYPE,
+                    v_seq & 0xFFFF, v_ts & 0xFFFFFFFF, video_ssrc,
+                )
+                preamble, extension = build_rtp_extension(twcc_seq)
+                packet_header = rtp_hdr + preamble
+                plaintext = extension + payload
+                with self.conn._nonce_lock:
+                    self.conn.nonce_counter += 1
+                    cnt = self.conn.nonce_counter
+                nonce = struct.pack(">I", cnt) + b"\x00" * 8
+                enc = cipher.encrypt(nonce, plaintext, packet_header)
+                packet = packet_header + enc + struct.pack(">I", cnt)
+                try:
+                    self.conn.udp_sock.sendto(packet, (self.conn.voice_ip, self.conn.voice_port))
+                    v_pkts += 1
+                    v_bytes += len(packet)
+                except Exception:
+                    pass
+                v_seq = (v_seq + 1) & 0xFFFF
+                twcc_seq = (twcc_seq + 1) & 0xFFFF
+
         def send_frame(nalus: list[bytes]) -> None:
-            nonlocal v_seq, v_ts, next_time, v_pkts, v_bytes, last_sr
+            nonlocal v_ts, next_time, last_sr
             if not nalus or not self.running:
                 return
+
+            if _rewrite_frame is not None:
+                try:
+                    nalus = _rewrite_frame(nalus)
+                except Exception:
+                    pass
 
             if HAS_DAVE and self.conn.dave_encryptor and not self.conn.dave_encryptor.is_passthrough_mode():
                 try:
@@ -714,61 +874,8 @@ class MediaStreamPump:
                     pass
 
             for n_idx, data in enumerate(nalus):
-                is_last_nalu = (n_idx == len(nalus) - 1)
-                hdr = data[0]
-                ntype = hdr & 0x1F
+                emit(data, n_idx == len(nalus) - 1)
 
-                if len(data) <= 1100:
-                    marker = 0x80 if is_last_nalu else 0x00
-                    rtp_hdr = struct.pack(">BBHII", 0x90, marker | 101, v_seq & 0xFFFF, v_ts & 0xFFFFFFFF, video_ssrc)
-                    packet_header = rtp_hdr + b"\xbe\xde\x00\x01\x51\x00\x00\x00"
-                    plaintext = data
-                    with self.conn._nonce_lock:
-                        self.conn.nonce_counter += 1
-                        cnt = self.conn.nonce_counter
-                    nonce = struct.pack(">I", cnt) + b"\x00" * 8
-                    enc = cipher.encrypt(nonce, plaintext, packet_header)
-                    packet = packet_header + enc + struct.pack(">I", cnt)
-                    try:
-                        self.conn.udp_sock.sendto(packet, (self.conn.voice_ip, self.conn.voice_port))
-                        v_pkts += 1
-                        v_bytes += len(packet)
-                    except Exception:
-                        pass
-                    v_seq = (v_seq + 1) & 0xFFFF
-                else:
-                    fnri = hdr & 0xE0
-                    fu_ind = fnri | 28
-                    body = data[1:]
-                    csize = 1100
-                    total_chunks = (len(body) + csize - 1) // csize
-                    for idx in range(total_chunks):
-                        c = body[idx * csize : (idx + 1) * csize]
-                        if idx == 0:
-                            fu_hdr = 0x80 | ntype
-                        elif idx == total_chunks - 1:
-                            fu_hdr = 0x40 | ntype
-                        else:
-                            fu_hdr = ntype
-                        fu_payload = bytes([fu_ind, fu_hdr]) + c
-                        is_last_packet = is_last_nalu and (idx == total_chunks - 1)
-                        marker = 0x80 if is_last_packet else 0x00
-                        rtp_hdr = struct.pack(">BBHII", 0x90, marker | 101, v_seq & 0xFFFF, v_ts & 0xFFFFFFFF, video_ssrc)
-                        packet_header = rtp_hdr + b"\xbe\xde\x00\x01\x51\x00\x00\x00"
-                        plaintext = fu_payload
-                        with self.conn._nonce_lock:
-                            self.conn.nonce_counter += 1
-                            cnt = self.conn.nonce_counter
-                        nonce = struct.pack(">I", cnt) + b"\x00" * 8
-                        enc = cipher.encrypt(nonce, plaintext, packet_header)
-                        packet = packet_header + enc + struct.pack(">I", cnt)
-                        try:
-                            self.conn.udp_sock.sendto(packet, (self.conn.voice_ip, self.conn.voice_port))
-                            v_pkts += 1
-                            v_bytes += len(packet)
-                        except Exception:
-                            pass
-                        v_seq = (v_seq + 1) & 0xFFFF
             v_ts = (v_ts + 3000) & 0xFFFFFFFF
             now = time.monotonic()
             if now - last_sr >= 1.0:
@@ -801,12 +908,20 @@ class MediaStreamPump:
                     if not data:
                         continue
                     ntype = data[0] & 0x1F
-                    if ntype == 9:
-                        if cur_frame:
-                            send_frame(cur_frame)
-                            cur_frame = []
+                    if ntype in (1, 5):
+                        # A slice with first_mb_in_slice == 0 starts a new frame.
+                        if _exp_golomb_first_mb(data) == 0:
+                            if cur_frame:
+                                send_frame(cur_frame)
+                                cur_frame = []
+                            cur_frame = pending + [data]
+                            pending = []
+                        else:
+                            cur_frame.append(data)
                     else:
-                        cur_frame.append(data)
+                        # Parameter sets and other NAL units belong to the
+                        # frame that follows them.
+                        pending.append(data)
             except Exception:
                 break
         if cur_frame:
@@ -1069,8 +1184,6 @@ class VoiceConnection:
         preferred = [
             "aead_aes256_gcm_rtpsize",
             "aead_xchacha20_poly1305_rtpsize",
-            "xsalsa20_poly1305_lite",
-            "xsalsa20_poly1305",
         ]
         for mode in preferred:
             if mode in modes:
@@ -1078,6 +1191,9 @@ class VoiceConnection:
                 break
         if not self.encryption_mode and modes:
             self.encryption_mode = modes[0]
+        if not self.encryption_mode.startswith("aead_") or not self.encryption_mode.endswith("_rtpsize"):
+            C.err(self.label, f"no AEAD RTP-size encryption mode offered by the server (got: {self.encryption_mode or 'none'})")
+            return False
 
         if not self._udp_discovery():
             C.warn(self.label, "UDP discovery failed, using fallback IP")
@@ -1093,23 +1209,19 @@ class VoiceConnection:
             },
         ]
         if self.is_stream:
+            # Only H.264 is offered: the media pump packetizes H.264, so
+            # advertising another codec (VP8 has a higher priority in the
+            # desktop client) makes the server pick a codec that never gets
+            # any media and the stream stays silent and black.
             codecs.append({
                 "name": "H264",
                 "type": "video",
                 "priority": 1000,
-                "payload_type": 101,
+                "payload_type": H264_PAYLOAD_TYPE,
                 "rtx_payload_type": 102,
                 "encode": True,
                 "decode": True,
-            })
-            codecs.append({
-                "name": "VP8",
-                "type": "video",
-                "priority": 2000,
-                "payload_type": 103,
-                "rtx_payload_type": 104,
-                "encode": True,
-                "decode": True,
+                "parameters": {},
             })
 
         self.ws.send(json.dumps({
@@ -1125,21 +1237,30 @@ class VoiceConnection:
             },
         }))
 
-        msg = self._recv_op(4, timeout=10)
-        if msg:
-            d = msg.get("d", {})
-            self.secret_key = bytes(d.get("secret_key", []))
-            self.encryption_mode = d.get("mode", self.encryption_mode)
-            a_codec = d.get("audio_codec", "opus")
-            v_codec = d.get("video_codec", "none")
-            self.dave_protocol_version = d.get("dave_protocol_version", 0)
-            C.ok(self.label, f"media route ready (audio={a_codec}, video={v_codec}, mode={self.encryption_mode})")
+        msg = self._recv_op(4, timeout=15)
+        if not msg:
+            C.err(self.label, "no Session Description (op 4) - the media key was never received")
+            return False
 
-            # Adaptive quality based on conditions
-            if a_codec == "opus" and v_codec == "H264":
-                C.info("stream", f"quality: auto-adapting to network conditions")
-            if HAS_DAVE:
-                self._init_dave()
+        d = msg.get("d", {})
+        self.secret_key = bytes(d.get("secret_key", []))
+        self.encryption_mode = d.get("mode", self.encryption_mode)
+        a_codec = d.get("audio_codec", "opus")
+        v_codec = d.get("video_codec", "none")
+        self.dave_protocol_version = d.get("dave_protocol_version", 0)
+        if len(self.secret_key) < 32:
+            C.err(self.label, f"Session Description carried an invalid secret key ({len(self.secret_key)} bytes)")
+            return False
+        if self.encryption_mode != "aead_aes256_gcm_rtpsize":
+            C.warn(self.label, f"server negotiated '{self.encryption_mode}' - only aead_aes256_gcm_rtpsize can be encrypted by this client")
+        C.ok(self.label, f"media route ready (audio={a_codec}, video={v_codec}, mode={self.encryption_mode})")
+
+        if self.is_stream and v_codec not in ("H264", "h264", "none"):
+            C.err(self.label, f"the server picked the '{v_codec}' video codec but only H.264 can be packetized")
+            return False
+
+        if HAS_DAVE:
+            self._init_dave()
 
         self.running = True
         return True
@@ -1741,6 +1862,8 @@ class GatewayStreamEngine:
         self.stream_token = ""
         self.stream_endpoint = ""
         self.rtc_server_id = ""
+        self.stream_server_id = ""
+        self.stream_channel_id = ""
         self.stream_connected = False
         self.stream_ever_active = False
         self._stream_recreate_attempts = 0
@@ -2082,10 +2205,10 @@ class GatewayStreamEngine:
                 status = f"{self.console.CYAN}⏳ starting stream{self.console.RESET}"
                 self.console.live("stream", f"{status} · {timer_str} ({counted_hours:.2f}h) counted")
             else:
-                status = f"{self.console.YELLOW}⏳ reconnecting{C.RESET}"
+                status = f"{self.console.YELLOW}⏳ reconnecting{self.console.RESET}"
                 self.console.live("stream", f"{status} · {timer_str} ({counted_hours:.2f}h) counted")
                 if self.ws and not self.ws.closed:
-                    self.console.info("stream", f"{self.console.GREY}› gateway is up; waiting for the voice link — watchdog re-joins automatically{C.RESET}")
+                    self.console.info("stream", f"{self.console.GREY}› gateway is up; waiting for the voice link — watchdog re-joins automatically{self.console.RESET}")
 
 
             if self.stream_connected and self.stream_key and self.ws and not self.ws.closed:
@@ -2489,6 +2612,7 @@ class GatewayStreamEngine:
                 self.voice_conn.send_speaking(False)
                 self.voice_conn.start_silence_pump()
                 self.voice_connected = True
+                self._watchdog_stream_retries = 0
                 C.ok("voice", f"{C.GREEN}voice connection established (ssrc={self.voice_conn.ssrc}){C.RESET}")
 
                 time.sleep(0.5)
@@ -2512,6 +2636,10 @@ class GatewayStreamEngine:
         elif event_type == "STREAM_CREATE":
             self.stream_key = d.get("stream_key", "")
             self.rtc_server_id = d.get("rtc_server_id", "")
+            # The server id and the channel id used when identifying the
+            # stream connection are the ones the gateway names here.
+            self.stream_server_id = str(d.get("server_id") or self.rtc_server_id or "")
+            self.stream_channel_id = str(d.get("channel_id") or self.channel_id or "")
             C.ok("stream", f"Go Live created! stream_key: {C.CYAN}{self.stream_key}{C.RESET}")
             self.stream_connected = True
             self.stream_ever_active = True
@@ -2579,23 +2707,33 @@ class GatewayStreamEngine:
                 if self.stream_conn:
                     self.stream_conn.close()
                     self.stream_conn = None
-                target_server = self.rtc_server_id or d.get("rtc_server_id") or d.get("guild_id") or self.guild_id or self.channel_id
-                v_session = self.voice_session_id or self.gateway_session_id
+                target_server = self.stream_server_id or self.rtc_server_id or d.get("rtc_server_id") or d.get("guild_id") or self.guild_id or self.channel_id
+                target_channel = self.stream_channel_id or self.channel_id
                 self.stream_conn = VoiceConnection(
                     endpoint=endpoint,
                     server_id=target_server,
                     user_id=self.user_id,
-                    session_id=v_session,
+                    session_id="",
                     token=token,
                     console=C,
                     label="stream_rtc",
                     is_stream=True,
                     stream_key=s_key,
-                    channel_id=self.channel_id,
+                    channel_id=target_channel,
                 )
+
                 def _connect_stream():
                     if not self.stream_conn:
                         return
+                    # The Go Live connection reuses the voice session id of the
+                    # call. It is only valid once VOICE_STATE_UPDATE arrived,
+                    # so wait for it instead of guessing with the gateway
+                    # session id (the server rejects that with 4006).
+                    v_session = self._wait_for_voice_session_id(15.0)
+                    if not v_session:
+                        C.err("stream_rtc", "no voice session id arrived - the stream media connection cannot be identified")
+                        return
+                    self.stream_conn.session_id = v_session
                     if self.stream_conn.connect():
                         self.stream_conn.start_heartbeat()
                         try:
@@ -2610,7 +2748,7 @@ class GatewayStreamEngine:
                                     "streams": [
                                         {
                                             "type": "video",
-                                            "rid": "100",
+                                            "rid": VIDEO_STREAM_ID,
                                             "ssrc": v_ssrc,
                                             "rtx_ssrc": r_ssrc,
                                             "active": True,
@@ -2631,14 +2769,14 @@ class GatewayStreamEngine:
                         if os.path.exists(video_file):
                             C.ok("stream_rtc", f"media source: {video_file}")
                             if not self.stream_conn.start_media_stream(video_file):
-                                C.warn("stream_rtc", "falling back to silent audio pump")
+                                C.err("stream_rtc", "the media pump failed to start - viewers will only hear silence")
                                 self.stream_conn.start_silence_pump()
                         else:
                             C.warn("stream_rtc", f"media file not found: {video_file}")
                             C.info("stream_rtc", f"{C.GREY}› set a valid file with menu option 7 or the STREAM_VIDEO env var{C.RESET}")
                             self.stream_conn.start_silence_pump()
                     else:
-                        C.warn("stream_rtc", "stream media connection handshake failed")
+                        C.err("stream_rtc", "stream media connection handshake failed - no video will be sent")
                 threading.Thread(target=_connect_stream, daemon=True).start()
 
         elif event_type == "STREAM_DELETE":
@@ -2670,7 +2808,24 @@ class GatewayStreamEngine:
             if status:
                 C.info(f"voice connection status: {status}")
 
-    def _cleanup(self, guild_id: str = "") -> None:
+    def _wait_for_voice_session_id(self, timeout: float = 15.0) -> str:
+        """Wait until the voice session id of the call is known.
+
+        The Go Live media connection has to identify with the voice session id
+        of the call it belongs to. The id arrives with VOICE_STATE_UPDATE and
+        can show up after the stream server answer, so it is waited for
+        instead of substituting the (unrelated) gateway session id.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.voice_session_id:
+                return self.voice_session_id
+            if not self.running:
+                break
+            time.sleep(0.25)
+        return self.voice_session_id
+
+    def _cleanup(self, guild_id: str = "", interactive: bool = True) -> None:
         C = self.console
         self.running = False
         target_guild = guild_id or self.guild_id
@@ -2732,7 +2887,8 @@ class GatewayStreamEngine:
             C.info("stream session ended.")
 
         C.rule()
-        input(f"  {C.ORANGE}›{C.RESET} press enter to return to menu")
+        if interactive:
+            input(f"  {C.ORANGE}›{C.RESET} press enter to return to menu")
 
 
 
