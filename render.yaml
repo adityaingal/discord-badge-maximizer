@@ -10,6 +10,8 @@ services:
         sync: false
       - key: SESSION_JSON
         sync: false
+      - key: AUTO_STREAM
+        value: "true"
       - key: PYTHON_VERSION
         value: 3.11.9
     healthCheckPath: /

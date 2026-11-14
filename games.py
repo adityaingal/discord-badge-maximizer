@@ -18,7 +18,13 @@ from typing import Iterator, Sequence
 
 WORKSPACE_DIR = Path(__file__).resolve().parent
 STATE_STORAGE_PATH = WORKSPACE_DIR / "session.json"
-DATABASE_STORAGE_PATH = WORKSPACE_DIR.parent / "data" / "games.json"
+DATABASE_STORAGE_PATH = (
+    WORKSPACE_DIR / "data" / "games.json"
+    if (WORKSPACE_DIR / "data").exists()
+    else (WORKSPACE_DIR.parent / "data" / "games.json"
+          if (WORKSPACE_DIR.parent / "data").exists()
+          else WORKSPACE_DIR / "data" / "games.json")
+)
 
 REST_IDENTITY_URL = "https://discord.com/api/v9/users/@me?with_analytics_token=true"
 DISCORD_USERS_API = "https://discord.com/api/v9/users"

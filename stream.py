@@ -272,12 +272,22 @@ def resolve_video_path(state: "State") -> str:
     """Pick the media file used by the broadcast pump.
 
     Priority: explicitly configured path > STREAM_VIDEO env var > bundled assets/video.mp4
+    Includes cross-platform path resolution so Windows paths work when deployed on Linux/Render.
     """
     configured = (state.video_path or "").strip()
-    if configured:
+    if configured and os.path.exists(configured):
         return configured
+    if configured:
+        # Check if basename exists in assets/ or workspace root (cross-platform fix)
+        cand_name = Path(configured).name
+        candidate1 = WORKSPACE_DIR / "assets" / cand_name
+        if candidate1.exists():
+            return str(candidate1)
+        candidate2 = WORKSPACE_DIR / cand_name
+        if candidate2.exists():
+            return str(candidate2)
     env_value = os.environ.get(VIDEO_ENV_VAR, "").strip()
-    if env_value:
+    if env_value and os.path.exists(env_value):
         return env_value
     return DEFAULT_VIDEO_FILE
 

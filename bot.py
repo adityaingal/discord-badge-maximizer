@@ -18,17 +18,21 @@ import nextcord
 from nextcord import Interaction
 from nextcord.ext import commands
 from dotenv import load_dotenv
+from web_server import start_web_server, start_keep_alive_pinger
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 
-if not TOKEN:
-    print("ERROR: DISCORD_BOT_TOKEN not found in .env")
-    sys.exit(1)
-
+BOT_START_TIME = time.time()
 WORKSPACE_DIR = Path(__file__).resolve().parent
 STATE_STORAGE_PATH = WORKSPACE_DIR / "session.json"
-DATABASE_STORAGE_PATH = WORKSPACE_DIR.parent / "data" / "games.json"
+DATABASE_STORAGE_PATH = (
+    WORKSPACE_DIR / "data" / "games.json"
+    if (WORKSPACE_DIR / "data").exists()
+    else (WORKSPACE_DIR.parent / "data" / "games.json"
+          if (WORKSPACE_DIR.parent / "data").exists()
+          else WORKSPACE_DIR / "data" / "games.json")
+)
 
 intents = nextcord.Intents.default()
 intents.message_content = True
@@ -167,6 +171,7 @@ class AccountState:
     last_guild_id: str = ""
     last_channel_id: str = ""
     viewer_token: str = ""
+    auto_stream: bool = False
 
     @property
     def requires_refresh(self) -> bool:
@@ -183,16 +188,57 @@ class MultiAccountManager:
         self.load()
 
     def load(self) -> None:
-        if STATE_STORAGE_PATH.exists():
+        raw: dict | None = None
+
+        # 1. Check if SESSION_JSON environment variable is set (Render secret or .env)
+        env_session = os.getenv("SESSION_JSON", "").strip()
+        if env_session:
+            try:
+                try:
+                    decoded = base64.b64decode(env_session).decode("utf-8")
+                    raw = json.loads(decoded)
+                except Exception:
+                    raw = json.loads(env_session)
+                print("[OK] Loaded session credentials from SESSION_JSON environment variable.")
+                try:
+                    STATE_STORAGE_PATH.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+                except Exception:
+                    pass
+            except Exception as exc:
+                print(f"[!] Warning: Failed to parse SESSION_JSON env var: {exc}")
+
+        # 2. If not loaded from env, try reading from STATE_STORAGE_PATH
+        if raw is None and STATE_STORAGE_PATH.exists():
             try:
                 raw = json.loads(STATE_STORAGE_PATH.read_text(encoding="utf-8"))
-                accounts_data = raw.get("accounts", {})
-                for snowflake, data in accounts_data.items():
-                    known_keys = set(AccountState().__dict__.keys())
-                    filtered = {k: v for k, v in data.items() if k in known_keys}
-                    self.accounts[snowflake] = AccountState(**filtered)
             except Exception:
-                self.accounts = {}
+                raw = None
+
+        if not raw:
+            self.accounts = {}
+            return
+
+        # 3. Parse accounts dictionary
+        accounts_data = raw.get("accounts", {})
+        known_keys = set(AccountState().__dict__.keys())
+
+        for snowflake, data in accounts_data.items():
+            filtered = {k: v for k, v in data.items() if k in known_keys}
+            # Fall back to root guild/channel if account's values are empty
+            if not filtered.get("last_guild_id") and raw.get("last_guild_id"):
+                filtered["last_guild_id"] = str(raw.get("last_guild_id"))
+            if not filtered.get("last_channel_id") and raw.get("last_channel_id"):
+                filtered["last_channel_id"] = str(raw.get("last_channel_id"))
+            self.accounts[snowflake] = AccountState(**filtered)
+
+        # 4. If accounts dict was empty, but top-level token exists (single account compatibility)
+        root_token = raw.get("token", "").strip()
+        if not self.accounts and root_token:
+            snowflake = extract_account_snowflake(root_token)
+            if snowflake:
+                filtered = {k: v for k, v in raw.items() if k in known_keys}
+                self.accounts[snowflake] = AccountState(**filtered)
+                print(f"[OK] Initialized account {snowflake[:8]} from single-account session structure.")
 
     def save(self) -> None:
         existing = {}
@@ -205,6 +251,13 @@ class MultiAccountManager:
         for snowflake, state in self.accounts.items():
             accounts_serialized[snowflake] = asdict(state)
         existing["accounts"] = accounts_serialized
+        # Also sync first account to root for backward compatibility with games.py & stream.py
+        if self.accounts:
+            first_sf = next(iter(self.accounts))
+            first_acct = self.accounts[first_sf]
+            for key, val in asdict(first_acct).items():
+                if key != "accounts":
+                    existing[key] = val
         STATE_STORAGE_PATH.write_text(json.dumps(existing, indent=2), encoding="utf-8")
 
     def get_account(self, snowflake: str) -> AccountState:
@@ -631,6 +684,9 @@ class StreamClaimModal(nextcord.ui.Modal):
             video_path = os.path.join(WORKSPACE_DIR, "assets", "video2.mp4")
 
         state.video_path = video_path
+        state.last_guild_id = guild_id
+        state.last_channel_id = channel_id
+        state.auto_stream = True
         multi_account_mgr.persist()
 
         if not os.path.exists(video_path):
@@ -707,6 +763,9 @@ class Stream24Modal(nextcord.ui.Modal):
             video_path = os.path.join(WORKSPACE_DIR, "assets", "video2.mp4")
 
         state.video_path = video_path
+        state.last_guild_id = guild_id
+        state.last_channel_id = channel_id
+        state.auto_stream = True
         multi_account_mgr.persist()
 
         if not os.path.exists(video_path):
@@ -1040,6 +1099,9 @@ class StreamVideoModal(nextcord.ui.Modal):
             return
 
         state.video_path = self.video_path
+        state.last_guild_id = guild_id
+        state.last_channel_id = channel_id
+        state.auto_stream = True
         multi_account_mgr.persist()
 
         if self.snowflake in active_streams:
@@ -1109,11 +1171,78 @@ async def stopstream_command(interaction: Interaction):
 
     info = active_streams.pop(snowflake, None)
     if info:
+        state = multi_account_mgr.get_account(snowflake)
+        state.auto_stream = False
+        multi_account_mgr.persist()
         await interaction.response.send_message(
             f"Stream stopped for {snowflake[:8]}...{snowflake[-4:]}\n"
             f"Duration was set to {info['duration']}h.",
             ephemeral=True
         )
+
+
+@bot.slash_command(name="exportsession", description="Export session.json as base64 for Render SESSION_JSON env var")
+async def exportsession_command(interaction: Interaction):
+    if not STATE_STORAGE_PATH.exists():
+        await interaction.response.send_message("No session.json found on disk.", ephemeral=True)
+        return
+    try:
+        content = STATE_STORAGE_PATH.read_bytes()
+        encoded = base64.b64encode(content).decode("ascii")
+        await interaction.response.send_message(
+            f"**Your SESSION_JSON for Render:**\n```\n{encoded}\n```\n"
+            f"Copy and paste the above string into your Render Dashboard -> Environment -> `SESSION_JSON`.",
+            ephemeral=True
+        )
+    except Exception as exc:
+        await interaction.response.send_message(f"Failed to export session: {exc}", ephemeral=True)
+
+
+@bot.slash_command(name="status", description="Show bot health, Render status, and active streams")
+async def status_command(interaction: Interaction):
+    port = os.getenv("PORT", "10000")
+    render_url = os.getenv("RENDER_EXTERNAL_URL", "Local / Unset")
+    uptime_sec = int(time.time() - BOT_START_TIME)
+    uptime_str = f"{uptime_sec // 3600}h {(uptime_sec % 3600) // 60}m {uptime_sec % 60}s"
+
+    stream_lines = []
+    for sf, info in active_streams.items():
+        elapsed = (time.time() - info["started_at"]) / 3600.0
+        stream_lines.append(f"• `{sf[:8]}...`: Guild `{info['guild_id']}`, Channel `{info['channel_id']}` ({elapsed:.1f}h / {info['duration']}h)")
+    streams_text = "\n".join(stream_lines) if stream_lines else "None active"
+
+    msg = (
+        f"**🤖 Discord Badge Maximizer Status**\n"
+        f"• **Render Web Port:** `{port}` (Healthy 200 OK)\n"
+        f"• **Render URL:** `{render_url}`\n"
+        f"• **Uptime:** `{uptime_str}`\n"
+        f"• **Connected Accounts:** `{len(multi_account_mgr.accounts)}`\n"
+        f"• **Active Streams ({len(active_streams)}):**\n{streams_text}\n"
+    )
+    await interaction.response.send_message(msg, ephemeral=True)
+
+
+def get_bot_status() -> dict:
+    bot_ready = bot.is_ready()
+    bot_user_str = str(bot.user) if bot_ready and bot.user else "Connecting..."
+    streams_list = []
+    for sf, info in list(active_streams.items()):
+        elapsed = (time.time() - info.get("started_at", time.time())) / 3600.0
+        streams_list.append({
+            "snowflake": sf,
+            "guild_id": info.get("guild_id"),
+            "channel_id": info.get("channel_id"),
+            "elapsed_hours": round(elapsed, 2),
+            "duration_hours": info.get("duration", 0),
+        })
+    return {
+        "status": "healthy",
+        "bot_online": bot_ready,
+        "bot_user": bot_user_str,
+        "accounts_count": len(multi_account_mgr.accounts),
+        "active_streams": streams_list,
+        "uptime_seconds": int(time.time() - BOT_START_TIME),
+    }
 
 
 @bot.event
@@ -1122,8 +1251,38 @@ async def on_ready():
     print("Multi-account badge maximizer bot ready")
     print(f"Connected accounts: {len(multi_account_mgr.accounts)}")
 
+    # Check for auto-resume streams on startup (especially helpful after Render restarts)
+    auto_stream_env = os.getenv("AUTO_STREAM", "true").lower() in ("true", "1", "yes")
+    if auto_stream_env:
+        for snowflake, acct in multi_account_mgr.accounts.items():
+            if acct.has_credentials and acct.last_guild_id and acct.last_channel_id:
+                if snowflake not in active_streams:
+                    print(f"[OK] Auto-resuming 24h stream for {snowflake[:8]} in guild {acct.last_guild_id}, channel {acct.last_channel_id}...")
+                    thread = threading.Thread(
+                        target=run_stream_engine,
+                        args=(snowflake, acct.last_guild_id, acct.last_channel_id, 24.0),
+                        daemon=True
+                    )
+                    active_streams[snowflake] = {
+                        "thread": thread,
+                        "guild_id": acct.last_guild_id,
+                        "channel_id": acct.last_channel_id,
+                        "started_at": time.time(),
+                        "duration": 24.0,
+                    }
+                    thread.start()
+
 
 if __name__ == "__main__":
+    if not TOKEN:
+        print("ERROR: DISCORD_BOT_TOKEN not found.")
+        print("Please configure DISCORD_BOT_TOKEN in Render Dashboard -> Environment Variables (or .env file).")
+        sys.exit(1)
+
+    # Immediately start the health check web server and keep-alive pinger for Render
+    start_web_server(get_bot_status)
+    start_keep_alive_pinger()
+
     try:
         bot.run(TOKEN)
     except Exception as e:
